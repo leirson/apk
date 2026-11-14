@@ -10,9 +10,12 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.audiofx.Equalizer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
 import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
@@ -22,12 +25,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.view.ViewOutlineProvider
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -41,7 +39,9 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 data class TrackItem(
@@ -86,35 +86,49 @@ data class RadioStation(
     val streamUrl: String
 )
 
+data class PodcastShow(
+    val name: String,
+    val author: String,
+    val coverUrl: String,
+    val episodes: List<TrackItem>
+)
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: SharedPreferences
     private val ioExecutor = Executors.newFixedThreadPool(4)
+    private val downloadExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val isBulkDownloading = AtomicBoolean(false)
 
-    // Image memory cache
-    private val bitmapCache = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
+    // Memory image cache + disk image cache
+    private val bitmapCache = object : LruCache<String, Bitmap>(28 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
 
     // API & Auth State
     private var serverBaseUrl: String = ""
     private var currentUsername: String = ""
-    private var currentRole: String = "ouvinte"
+    private var currentRole: String = "admin"
+    private var isServerReachable: Boolean = false
+    private var forceOfflineMode: Boolean = false
+    private var maxOfflineStorageMB: Long = 2048L // Default 2 GB
+    private var downloadedSyncProgressText: String = ""
 
-    // Library Data from PHP API
+    // Library Data
     private var allTracks = mutableListOf<TrackItem>()
     private var artistPhotosMap = mutableMapOf<String, String>()
     private var favoriteIds = mutableSetOf<String>()
     private var playlists = mutableListOf<PlaylistGroup>()
     private var radioStations = mutableListOf<RadioStation>()
+    private var podcastShows = mutableListOf<PodcastShow>()
 
-    // UI Filter / Navigation State
-    private var currentTab = "albums" // "albums" | "artists" | "tracks" | "playlists" | "radios" | "webview"
+    // Navigation & Filtering State
+    private var currentTab = "albums" // "albums" | "artists" | "playlists" | "radios" | "podcasts" | "settings"
     private var searchQuery = ""
     private var selectedArtistFilter: String? = null
     private var selectedAlbumFilter: AlbumGroup? = null
-    private var showOnlyFavorites = false
+    private var selectedPodcastFilter: PodcastShow? = null
 
     // Audio Player State
     private var mediaPlayer: MediaPlayer? = null
@@ -125,17 +139,17 @@ class MainActivity : AppCompatActivity() {
     private var isShuffleEnabled = false
     private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
 
-    // Root Views
+    // Views
     private lateinit var rootContainer: LinearLayout
-    private lateinit var topHeaderStatus: TextView
+    private lateinit var topStatusPill: TextView
+    private lateinit var topSubStatusTxt: TextView
+    private lateinit var searchBarContainer: LinearLayout
     private lateinit var searchInput: EditText
     private lateinit var contentScroll: ScrollView
     private lateinit var contentContainer: LinearLayout
-    private lateinit var webViewContainer: FrameLayout
-    private var webView: WebView? = null
 
-    // Mini Player Views
-    private lateinit var miniPlayerBar: LinearLayout
+    // Floating Mini Player Views
+    private lateinit var miniPlayerCard: LinearLayout
     private lateinit var miniCoverImg: ImageView
     private lateinit var miniTitleTxt: TextView
     private lateinit var miniArtistTxt: TextView
@@ -143,15 +157,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var miniSeekBar: SeekBar
     private lateinit var miniTimeTxt: TextView
 
-    // Tab Buttons
-    private val tabButtons = mutableMapOf<String, TextView>()
+    // Bottom Navigation Tab Views
+    private val tabButtons = mutableMapOf<String, LinearLayout>()
+    private val tabIcons = mutableMapOf<String, TextView>()
+    private val tabLabels = mutableMapOf<String, TextView>()
 
     companion object {
         private const val PREFS_NAME = "PHPlayerNativeApiPrefs"
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_USERNAME = "username"
         private const val KEY_ROLE = "user_role"
-        private const val KEY_CACHE_AUDIO = "cache_audio_offline"
+        private const val KEY_FORCE_OFFLINE = "force_offline_mode"
+        private const val KEY_MAX_OFFLINE_MB = "max_offline_storage_mb"
         private const val DEFAULT_SERVER_URL = "http://leirson.ddns.me"
     }
 
@@ -178,12 +195,23 @@ class MainActivity : AppCompatActivity() {
         serverBaseUrl = normalizeServerUrl(prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL)
         currentUsername = prefs.getString(KEY_USERNAME, "admin") ?: "admin"
         currentRole = prefs.getString(KEY_ROLE, "admin") ?: "admin"
+        forceOfflineMode = prefs.getBoolean(KEY_FORCE_OFFLINE, false)
+        maxOfflineStorageMB = prefs.getLong(KEY_MAX_OFFLINE_MB, 2048L)
 
-        buildMainLayout()
+        // Load locally persisted catalog immediately so offline works on cold boot
+        loadOfflineCatalogFromDisk()
+
+        buildModernLayout()
         setContentView(rootContainer)
 
         mainHandler.post(progressRunnable)
-        syncAllFromApi()
+        if (forceOfflineMode || !isNetworkAvailable()) {
+            isServerReachable = false
+            updateHeaderStatusUI()
+            renderCurrentTab()
+        } else {
+            syncAllFromApi()
+        }
     }
 
     override fun onDestroy() {
@@ -192,20 +220,284 @@ class MainActivity : AppCompatActivity() {
         releasePlayer()
     }
 
+    // =========================================================================
+    // OFFLINE STORAGE & LOCAL PERSISTENCE ENGINE
+    // =========================================================================
+    private fun getAudioCacheDir(): File = File(filesDir, "audio_cache").apply { mkdirs() }
+    private fun getImageCacheDir(): File = File(filesDir, "image_cache").apply { mkdirs() }
+    private fun getMetaCacheDir(): File = File(filesDir, "meta_cache").apply { mkdirs() }
+
+    private fun getTrackOfflineFile(trackId: String): File {
+        val safeId = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+        return File(getAudioCacheDir(), "track_$safeId.mp3")
+    }
+
+    private fun isTrackStoredOffline(trackId: String): Boolean {
+        if (trackId.startsWith("radio-")) return false
+        val f = getTrackOfflineFile(trackId)
+        return f.exists() && f.length() > 1024L
+    }
+
+    private fun isOfflineModeActive(): Boolean {
+        return forceOfflineMode || !isServerReachable || !isNetworkAvailable()
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun getUsedOfflineAudioBytes(): Long {
+        val files = getAudioCacheDir().listFiles() ?: return 0L
+        var total = 0L
+        for (f in files) {
+            if (f.isFile) total += f.length()
+        }
+        return total
+    }
+
+    private fun getOfflineTracksCount(): Int {
+        val files = getAudioCacheDir().listFiles() ?: return 0
+        return files.count { it.isFile && it.name.endsWith(".mp3") && it.length() > 1024L }
+    }
+
+    private fun getDeviceFreeBytes(): Long {
+        return try {
+            val stat = StatFs(filesDir.absolutePath)
+            stat.availableBytes
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val mb = bytes.toDouble() / (1024.0 * 1024.0)
+        return if (mb >= 1024.0) {
+            String.format("%.2f GB", mb / 1024.0)
+        } else {
+            String.format("%.0f MB", mb)
+        }
+    }
+
+    private fun saveOfflineCatalogToDisk(tracksRaw: String, photosRaw: String, favRaw: String, plRaw: String, radRaw: String) {
+        try {
+            val dir = getMetaCacheDir()
+            if (tracksRaw.isNotEmpty()) File(dir, "tracks.json").writeText(tracksRaw, Charsets.UTF_8)
+            if (photosRaw.isNotEmpty()) File(dir, "photos.json").writeText(photosRaw, Charsets.UTF_8)
+            if (favRaw.isNotEmpty()) File(dir, "favorites.json").writeText(favRaw, Charsets.UTF_8)
+            if (plRaw.isNotEmpty()) File(dir, "playlists.json").writeText(plRaw, Charsets.UTF_8)
+            if (radRaw.isNotEmpty()) File(dir, "radios.json").writeText(radRaw, Charsets.UTF_8)
+        } catch (_: Exception) {}
+    }
+
+    private fun loadOfflineCatalogFromDisk() {
+        try {
+            val dir = getMetaCacheDir()
+            val tracksFile = File(dir, "tracks.json")
+            if (tracksFile.exists()) {
+                val parsed = parseTracksJson(tracksFile.readText(Charsets.UTF_8))
+                allTracks.clear()
+                allTracks.addAll(parsed)
+                rebuildPodcastShowsFromTracks()
+            }
+            val photosFile = File(dir, "photos.json")
+            if (photosFile.exists()) {
+                val pObj = JSONObject(extractJsonPayload(photosFile.readText(Charsets.UTF_8)))
+                val photosNode = pObj.optJSONObject("photos")
+                if (photosNode != null) {
+                    artistPhotosMap.clear()
+                    val keys = photosNode.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val v = photosNode.optString(k, "")
+                        if (v.isNotEmpty()) artistPhotosMap[k] = resolveMediaUrl(v)
+                    }
+                }
+            }
+            val favFile = File(dir, "favorites.json")
+            if (favFile.exists()) {
+                val favArr = JSONArray(extractJsonPayload(favFile.readText(Charsets.UTF_8)))
+                favoriteIds.clear()
+                for (i in 0 until favArr.length()) {
+                    favoriteIds.add(favArr.optString(i))
+                }
+            }
+            val plFile = File(dir, "playlists.json")
+            if (plFile.exists()) {
+                val plArr = JSONArray(extractJsonPayload(plFile.readText(Charsets.UTF_8)))
+                playlists.clear()
+                for (i in 0 until plArr.length()) {
+                    val o = plArr.optJSONObject(i) ?: continue
+                    val tIds = mutableListOf<String>()
+                    val tArr = o.optJSONArray("trackIds")
+                    if (tArr != null) {
+                        for (j in 0 until tArr.length()) tIds.add(tArr.optString(j))
+                    }
+                    playlists.add(PlaylistGroup(o.optString("id"), o.optString("name", "Playlist"), tIds))
+                }
+            }
+            val radFile = File(dir, "radios.json")
+            if (radFile.exists()) {
+                val radArr = JSONArray(extractJsonPayload(radFile.readText(Charsets.UTF_8)))
+                radioStations.clear()
+                for (i in 0 until radArr.length()) {
+                    val o = radArr.optJSONObject(i) ?: continue
+                    radioStations.add(RadioStation(o.optString("id", "$i"), o.optString("name", "Rádio"), o.optString("url", "")))
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Automatically downloads all library songs to local phone storage in the background
+     * up to the user's selected storage limit (maxOfflineStorageMB).
+     */
+    private fun startAutoOfflineDownloadWorker(showToastOnStart: Boolean = false) {
+        if (forceOfflineMode || !isServerReachable) return
+        if (isBulkDownloading.getAndSet(true)) {
+            if (showToastOnStart) {
+                Toast.makeText(this, "Download offline já está em andamento em segundo plano.", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        if (showToastOnStart) {
+            Toast.makeText(this, "Sincronizando músicas para armazenamento local offline...", Toast.LENGTH_SHORT).show()
+        }
+
+        downloadExecutor.execute {
+            try {
+                // Prioritize favorite tracks first, then regular music tracks, then podcasts
+                val orderedTracks = allTracks.sortedByDescending { favoriteIds.contains(it.id) }
+                val limitBytes = if (maxOfflineStorageMB <= 0L) Long.MAX_VALUE else maxOfflineStorageMB * 1024L * 1024L
+
+                var downloadedNow = 0
+                val missingTracks = orderedTracks.filter { !isTrackStoredOffline(it.id) && !it.id.startsWith("radio-") }
+
+                for ((idx, track) in missingTracks.withIndex()) {
+                    if (forceOfflineMode) break
+                    val currentUsed = getUsedOfflineAudioBytes()
+                    if (currentUsed >= limitBytes) {
+                        mainHandler.post {
+                            downloadedSyncProgressText = "Limite de espaço atingido (${formatBytes(currentUsed)} / ${if (maxOfflineStorageMB <= 0L) "Ilimitado" else "${maxOfflineStorageMB} MB"})"
+                            if (currentTab == "settings") renderCurrentTab()
+                        }
+                        break
+                    }
+
+                    mainHandler.post {
+                        downloadedSyncProgressText = "Salvando offline (${idx + 1}/${missingTracks.size}): ${track.title}"
+                        updateHeaderStatusUI()
+                        if (currentTab == "settings") renderCurrentTab()
+                    }
+
+                    // Also cache cover image on disk
+                    if (track.coverUrl.isNotEmpty()) {
+                        cacheImageToDiskSync(track.coverUrl)
+                    }
+
+                    val targetFile = getTrackOfflineFile(track.id)
+                    val streamUrl = getApiEndpoint("stream", "id=" + URLEncoder.encode(track.id, "UTF-8"))
+                    val success = downloadFileSync(streamUrl, targetFile, limitBytes - currentUsed)
+                    if (success) {
+                        downloadedNow++
+                    }
+                }
+
+                mainHandler.post {
+                    val totalOffline = getOfflineTracksCount()
+                    downloadedSyncProgressText = if (downloadedNow > 0) {
+                        "✓ $totalOffline músicas salvas no celular (${formatBytes(getUsedOfflineAudioBytes())})"
+                    } else {
+                        "✓ Biblioteca offline atualizada ($totalOffline músicas salvas)"
+                    }
+                    updateHeaderStatusUI()
+                    renderCurrentTab()
+                }
+            } catch (_: Exception) {
+            } finally {
+                isBulkDownloading.set(false)
+            }
+        }
+    }
+
+    private fun downloadFileSync(urlStr: String, targetFile: File, maxAllowedBytes: Long): Boolean {
+        if (targetFile.exists() && targetFile.length() > 1024L) return true
+        val tempFile = File(targetFile.parentFile, "${targetFile.name}.tmp")
+        return try {
+            val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10000
+                readTimeout = 25000
+                setRequestProperty("User-Agent", "PHPlayerAndroidAPI/1.4")
+            }
+            if (conn.responseCode in 200..299) {
+                val contentLength = conn.contentLengthLong
+                if (contentLength > 0 && contentLength > maxAllowedBytes) {
+                    conn.disconnect()
+                    return false
+                }
+                conn.inputStream.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        val buf = ByteArray(16 * 1024)
+                        var copied = 0L
+                        var read: Int
+                        while (input.read(buf).also { read = it } != -1) {
+                            copied += read
+                            if (copied > maxAllowedBytes) {
+                                tempFile.delete()
+                                return false
+                            }
+                            output.write(buf, 0, read)
+                        }
+                    }
+                }
+                if (tempFile.length() > 1024L) {
+                    tempFile.renameTo(targetFile)
+                    true
+                } else {
+                    tempFile.delete()
+                    false
+                }
+            } else {
+                false
+            }
+        } catch (_: Exception) {
+            tempFile.delete()
+            false
+        }
+    }
+
+    private fun enforceStorageQuotaIfNeeded() {
+        if (maxOfflineStorageMB <= 0L) return
+        val maxBytes = maxOfflineStorageMB * 1024L * 1024L
+        val files = getAudioCacheDir().listFiles()?.filter { it.isFile && it.name.endsWith(".mp3") }?.sortedBy { it.lastModified() } ?: return
+        var used = files.sumOf { it.length() }
+        for (f in files) {
+            if (used <= maxBytes) break
+            val len = f.length()
+            if (f.delete()) {
+                used -= len
+            }
+        }
+    }
+
+    // =========================================================================
+    // URL & TRACK HELPERS
+    // =========================================================================
     private fun normalizeServerUrl(raw: String): String {
         var clean = raw.trim().removeSuffix("/")
         if (clean.isEmpty()) clean = DEFAULT_SERVER_URL
         if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
             clean = "http://$clean"
         }
-        if (clean.endsWith("/api.php")) {
-            clean = clean.removeSuffix("/api.php")
-        }
-        if (clean.endsWith("/index.php")) {
-            clean = clean.removeSuffix("/index.php")
-        }
-        if (clean.endsWith("/mobile.php")) {
-            clean = clean.removeSuffix("/mobile.php")
+        for (suffix in listOf("/api.php", "/index.php", "/mobile.php")) {
+            if (clean.endsWith(suffix)) clean = clean.removeSuffix(suffix)
         }
         return clean.removeSuffix("/")
     }
@@ -222,31 +514,68 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isPodcastTrack(track: TrackItem): Boolean {
-        val g = track.genre.lowercase()
-        val f = track.fileName.lowercase()
-        val a = track.artist.lowercase()
-        return g == "podcast" || f.contains("podcast/") || f.contains("/podcast/") || a == "podcast"
+        val g = track.genre.lowercase().trim()
+        val f = track.fileName.lowercase().replace("\\", "/")
+        val a = track.artist.lowercase().trim()
+        return g == "podcast" || g == "podcasts" || f.startsWith("podcast/") || f.contains("/podcast/") || a == "podcast"
+    }
+
+    /**
+     * Returns visible music tracks. When Offline Mode is active, returns ONLY tracks stored locally on the phone!
+     */
+    private fun getVisibleMusicTracks(): List<TrackItem> {
+        val musicOnly = allTracks.filter { !isPodcastTrack(it) }
+        return if (isOfflineModeActive()) {
+            musicOnly.filter { isTrackStoredOffline(it.id) }
+        } else {
+            musicOnly
+        }
+    }
+
+    private fun getVisiblePodcastTracks(): List<TrackItem> {
+        val podOnly = allTracks.filter { isPodcastTrack(it) }
+        return if (isOfflineModeActive()) {
+            podOnly.filter { isTrackStoredOffline(it.id) }
+        } else {
+            podOnly
+        }
     }
 
     // =========================================================================
-    // UI CONSTRUCTION (100% Programmatic Material Dark Slate UI)
+    // MODERN UI CONSTRUCTION (Obsidian + Emerald/Sky Glass Theme)
     // =========================================================================
-    private fun buildMainLayout() {
+    private fun buildModernLayout() {
         rootContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#070b13"))
+            setBackgroundColor(Color.parseColor("#050811"))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        // 1. Top App Bar
-        val topBar = LinearLayout(this).apply {
+        // 1. Sleek Modern Header (No cluttered buttons — API/Login & Sync live in Settings tab)
+        val headerBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#0b111e"))
-            setPadding(dp(14), dp(12), dp(14), dp(12))
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.parseColor("#0f172a"), Color.parseColor("#050811"))
+            )
+        }
+
+        val brandBadge = TextView(this).apply {
+            text = "♫"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(Color.parseColor("#0ea5e9"), Color.parseColor("#6366f1"))
+            ).apply { cornerRadius = dp(12).toFloat() }
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38)).apply { rightMargin = dp(12) }
         }
 
         val titleCol = LinearLayout(this).apply {
@@ -255,53 +584,55 @@ class MainActivity : AppCompatActivity() {
         }
 
         val appTitle = TextView(this).apply {
-            text = "🎵 PHPLAYER ANDROID API"
+            text = "PHPlayer"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
         }
 
-        topHeaderStatus = TextView(this).apply {
-            text = "Conectando a $serverBaseUrl..."
-            setTextColor(Color.parseColor("#38bdf8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+        topSubStatusTxt = TextView(this).apply {
+            text = "Carregando biblioteca..."
+            setTextColor(Color.parseColor("#94a3b8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
 
         titleCol.addView(appTitle)
-        titleCol.addView(topHeaderStatus)
-        topBar.addView(titleCol)
+        titleCol.addView(topSubStatusTxt)
 
-        val refreshBtn = createPillButton("↻ Sync", "#1e293b", "#38bdf8") {
-            syncAllFromApi()
+        topStatusPill = TextView(this).apply {
+            text = "ONLINE"
+            setTextColor(Color.parseColor("#10b981"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(10), dp(5), dp(10), dp(5))
+            background = roundedBox("#052e16", "#10b981", 20)
+            setOnClickListener {
+                switchTab("settings")
+            }
         }
-        val settingsBtn = createPillButton("⚙ API / Login", "#0284c7", "#ffffff") {
-            showApiConfigDialog()
-        }.apply {
-            (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6)
-        }
 
-        topBar.addView(refreshBtn)
-        topBar.addView(settingsBtn)
-        rootContainer.addView(topBar)
+        headerBar.addView(brandBadge)
+        headerBar.addView(titleCol)
+        headerBar.addView(topStatusPill)
+        rootContainer.addView(headerBar)
 
-        // 2. Search Bar + Quick Shuffle Bar
-        val searchRow = LinearLayout(this).apply {
+        // 2. Modern Search Bar + Quick Shuffle Pill
+        searchBarContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#090e1a"))
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(16), dp(4), dp(16), dp(10))
         }
 
         searchInput = EditText(this).apply {
-            hint = "Buscar música, artista ou álbum..."
+            hint = "🔍 Pesquisar álbuns, artistas, podcasts..."
             setHintTextColor(Color.parseColor("#64748b"))
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             isSingleLine = true
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = roundedBox("#111827", "#1e293b", 10)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = roundedBox("#0d1324", "#1e293b", 14)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
@@ -313,63 +644,50 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        val shuffleAllBtn = createPillButton("🔀 Aleatório", "#4f46e5", "#ffffff") {
+        val quickShuffleBtn = createModernButton("🔀 Tocar Aleatório", "#4f46e5", "#ffffff", 14) {
             playRandomLibraryQueue()
         }.apply {
             (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8)
         }
 
-        searchRow.addView(searchInput)
-        searchRow.addView(shuffleAllBtn)
-        rootContainer.addView(searchRow)
+        searchBarContainer.addView(searchInput)
+        searchBarContainer.addView(quickShuffleBtn)
+        rootContainer.addView(searchBarContainer)
 
-        // 3. Main Content Area (Scrollable Native Views + Optional WebView)
-        val middleFrame = FrameLayout(this).apply {
+        // 3. Scrollable Main Content Container
+        contentScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0,
                 1f
-            )
-        }
-
-        contentScroll = ScrollView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
             )
             isFillViewport = true
         }
 
         contentContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(24))
+            setPadding(dp(16), dp(6), dp(16), dp(28))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
         contentScroll.addView(contentContainer)
-        middleFrame.addView(contentScroll)
+        rootContainer.addView(contentScroll)
 
-        webViewContainer = FrameLayout(this).apply {
-            visibility = View.GONE
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        middleFrame.addView(webViewContainer)
-        rootContainer.addView(middleFrame)
-
-        // 4. Persistent Mini Player Bar
-        miniPlayerBar = LinearLayout(this).apply {
+        // 4. Floating Glass Mini-Player Card
+        miniPlayerCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0f172a"))
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = roundedBox("#11192e", "#253252", 18)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             visibility = View.GONE
-            setOnClickListener {
-                showExpandedPlayerDialog()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), dp(4), dp(12), dp(8))
             }
+            setOnClickListener { showExpandedPlayerDialog() }
         }
 
         val miniTopRow = LinearLayout(this).apply {
@@ -377,12 +695,8 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        miniCoverImg = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply {
-                rightMargin = dp(10)
-            }
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#1e293b"))
+        miniCoverImg = createRoundedImageView(dp(46), 10).apply {
+            (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(12)
         }
 
         val miniInfoCol = LinearLayout(this).apply {
@@ -391,7 +705,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         miniTitleTxt = TextView(this).apply {
-            text = "Nenhuma música tocando"
+            text = "Selecione uma música"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = Typeface.DEFAULT_BOLD
@@ -400,7 +714,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         miniArtistTxt = TextView(this).apply {
-            text = "Selecione uma faixa"
+            text = "PHPlayer"
             setTextColor(Color.parseColor("#38bdf8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             maxLines = 1
@@ -411,16 +725,24 @@ class MainActivity : AppCompatActivity() {
         miniInfoCol.addView(miniArtistTxt)
 
         val prevBtn = createIconBtn("⏮") { playPrevious() }
-        miniPlayPauseBtn = createIconBtn("▶") { togglePlayPause() }
+        miniPlayPauseBtn = TextView(this).apply {
+            text = "▶"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            background = roundedBox("#0ea5e9", "#38bdf8", 20)
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                setMargins(dp(4), 0, dp(4), 0)
+            }
+            setOnClickListener { togglePlayPause() }
+        }
         val nextBtn = createIconBtn("⏭") { playNext() }
-        val eqBtn = createIconBtn("🎚") { showEqualizerDialog() }
 
         miniTopRow.addView(miniCoverImg)
         miniTopRow.addView(miniInfoCol)
         miniTopRow.addView(prevBtn)
         miniTopRow.addView(miniPlayPauseBtn)
         miniTopRow.addView(nextBtn)
-        miniTopRow.addView(eqBtn)
 
         val miniSeekRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -432,9 +754,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        mediaPlayer?.seekTo(progress * 1000)
-                    }
+                    if (fromUser) mediaPlayer?.seekTo(progress * 1000)
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -450,118 +770,155 @@ class MainActivity : AppCompatActivity() {
         miniSeekRow.addView(miniSeekBar)
         miniSeekRow.addView(miniTimeTxt)
 
-        miniPlayerBar.addView(miniTopRow)
-        miniPlayerBar.addView(miniSeekRow)
-        rootContainer.addView(miniPlayerBar)
+        miniPlayerCard.addView(miniTopRow)
+        miniPlayerCard.addView(miniSeekRow)
+        rootContainer.addView(miniPlayerCard)
 
-        // 5. Bottom Navigation Bar
+        // 5. Modern Bottom Navigation Bar (Removed Músicas & Web, Added Podcasts & Config)
         val bottomNav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#0b111e"))
-            setPadding(dp(4), dp(8), dp(4), dp(8))
+            setBackgroundColor(Color.parseColor("#090d1a"))
+            setPadding(dp(6), dp(8), dp(6), dp(10))
         }
 
         val tabs = listOf(
-            "albums" to "💿 Álbuns",
-            "artists" to "🎤 Artistas",
-            "tracks" to "🎵 Músicas",
-            "playlists" to "📂 Playlists",
-            "radios" to "📻 Rádios",
-            "webview" to "🌐 Web"
+            Triple("albums", "💿", "Álbuns"),
+            Triple("artists", "🎤", "Artistas"),
+            Triple("playlists", "📂", "Playlists"),
+            Triple("radios", "📻", "Rádios"),
+            Triple("podcasts", "🎙", "Podcast"),
+            Triple("settings", "⚙", "Config")
         )
 
-        for ((tabId, label) in tabs) {
-            val btn = TextView(this).apply {
-                text = label
+        for ((tabId, iconStr, labelStr) in tabs) {
+            val tabBox = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(4), dp(8), dp(4), dp(8))
+                setPadding(dp(4), dp(6), dp(4), dp(6))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 setOnClickListener {
                     selectedArtistFilter = null
                     selectedAlbumFilter = null
+                    selectedPodcastFilter = null
                     switchTab(tabId)
                 }
             }
-            tabButtons[tabId] = btn
-            bottomNav.addView(btn)
+            val iconView = TextView(this).apply {
+                text = iconStr
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            }
+            val lblView = TextView(this).apply {
+                text = labelStr
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            tabBox.addView(iconView)
+            tabBox.addView(lblView)
+            tabButtons[tabId] = tabBox
+            tabIcons[tabId] = iconView
+            tabLabels[tabId] = lblView
+            bottomNav.addView(tabBox)
         }
 
         rootContainer.addView(bottomNav)
         updateTabStyles()
+        updateHeaderStatusUI()
     }
 
     private fun switchTab(tabId: String) {
         currentTab = tabId
+        searchBarContainer.visibility = if (tabId == "settings") View.GONE else View.VISIBLE
         updateTabStyles()
-        if (tabId == "webview") {
-            contentScroll.visibility = View.GONE
-            webViewContainer.visibility = View.VISIBLE
-            ensureWebViewLoaded()
-        } else {
-            webViewContainer.visibility = View.GONE
-            contentScroll.visibility = View.VISIBLE
-            renderCurrentTab()
-        }
+        renderCurrentTab()
     }
 
     private fun updateTabStyles() {
-        for ((id, btn) in tabButtons) {
+        for ((id, box) in tabButtons) {
+            val lbl = tabLabels[id]
             if (id == currentTab) {
-                btn.setTextColor(Color.parseColor("#38bdf8"))
-                btn.background = roundedBox("#1e293b", "#0284c7", 8)
+                box.background = roundedBox("#152238", "#0ea5e9", 12)
+                lbl?.setTextColor(Color.parseColor("#38bdf8"))
             } else {
-                btn.setTextColor(Color.parseColor("#94a3b8"))
-                btn.setBackgroundColor(Color.TRANSPARENT)
+                box.setBackgroundColor(Color.TRANSPARENT)
+                lbl?.setTextColor(Color.parseColor("#64748b"))
             }
         }
     }
 
-    private fun ensureWebViewLoaded() {
-        if (webView == null) {
-            webView = WebView(this).apply {
-                layoutParams = FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                }
-                webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
-                    override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: android.net.http.SslError?) {
-                        handler?.proceed()
-                    }
-                }
-                webChromeClient = WebChromeClient()
-            }
-            webViewContainer.addView(webView)
+    private fun updateHeaderStatusUI() {
+        val offlineCount = getOfflineTracksCount()
+        if (isOfflineModeActive()) {
+            topStatusPill.text = "📴 OFFLINE ($offlineCount)"
+            topStatusPill.setTextColor(Color.parseColor("#fbbf24"))
+            topStatusPill.background = roundedBox("#451a03", "#f59e0b", 20)
+            topSubStatusTxt.text = "Modo Offline • Exibindo $offlineCount músicas salvas no celular"
+            topSubStatusTxt.setTextColor(Color.parseColor("#fbbf24"))
+        } else {
+            topStatusPill.text = "● ONLINE"
+            topStatusPill.setTextColor(Color.parseColor("#34d399"))
+            topStatusPill.background = roundedBox("#052e16", "#10b981", 20)
+            val totalMusic = allTracks.count { !isPodcastTrack(it) }
+            val extra = if (downloadedSyncProgressText.isNotEmpty()) " • $downloadedSyncProgressText" else " • $offlineCount salvas offline"
+            topSubStatusTxt.text = "$currentUsername • $totalMusic músicas$extra"
+            topSubStatusTxt.setTextColor(Color.parseColor("#94a3b8"))
         }
-        webView?.loadUrl("$serverBaseUrl/mobile.php")
     }
 
     // =========================================================================
-    // API COMMUNICATION WITH PHP SERVER (api.php)
+    // API SYNC WITH AUTOMATIC OFFLINE CACHING
     // =========================================================================
-    private fun syncAllFromApi() {
-        topHeaderStatus.text = "Sincronizando com $serverBaseUrl/api.php..."
-        topHeaderStatus.setTextColor(Color.parseColor("#fbbf24"))
+    private fun syncAllFromApi(triggerToast: Boolean = false) {
+        topSubStatusTxt.text = "Sincronizando catálogo com $serverBaseUrl..."
+        topSubStatusTxt.setTextColor(Color.parseColor("#38bdf8"))
 
         ioExecutor.execute {
             try {
-                // 1. Fetch tracks
                 val tracksRaw = httpGet(getApiEndpoint("tracks"))
-                val parsedTracks = parseTracksJson(tracksRaw)
+                val parsedTracks = parseTracksJson(tracksRaw).toMutableList()
 
-                // 2. Fetch custom artist photos / logos
+                // Also fetch podcasts from ?route=podcasts so episodes from RSS feeds are included
+                try {
+                    val podRaw = httpGet(getApiEndpoint("podcasts"))
+                    val podArr = JSONArray(extractJsonPayload(podRaw))
+                    val existingIds = parsedTracks.map { it.id }.toMutableSet()
+                    for (i in 0 until podArr.length()) {
+                        val podObj = podArr.optJSONObject(i) ?: continue
+                        val podName = podObj.optString("name", "Podcast")
+                        val podArtist = podObj.optString("artist", podName)
+                        val podCover = resolveMediaUrl(podObj.optString("coverUrl", ""))
+                        val eps = podObj.optJSONArray("episodes") ?: continue
+                        for (j in 0 until eps.length()) {
+                            val ep = eps.optJSONObject(j) ?: continue
+                            val epId = ep.optString("id", "")
+                            if (epId.isNotEmpty() && !existingIds.contains(epId)) {
+                                existingIds.add(epId)
+                                parsedTracks.add(
+                                    TrackItem(
+                                        id = epId,
+                                        title = ep.optString("title", "Episódio"),
+                                        artist = podArtist,
+                                        album = podName,
+                                        genre = "Podcast",
+                                        duration = ep.optInt("duration", 0),
+                                        coverUrl = resolveMediaUrl(ep.optString("coverUrl", ep.optString("cover_url", podCover))),
+                                        albumYear = "",
+                                        albumType = "podcast",
+                                        trackNumber = j + 1,
+                                        fileName = ep.optString("fileName", ep.optString("file_name", ""))
+                                    )
+                                )
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+
+                var photosRaw = ""
                 val photosMap = mutableMapOf<String, String>()
                 try {
-                    val photosRaw = httpGet(getApiEndpoint("artist_photos"))
-                    val pObj = JSONObject(photosRaw)
+                    photosRaw = httpGet(getApiEndpoint("artist_photos"))
+                    val pObj = JSONObject(extractJsonPayload(photosRaw))
                     val photosNode = pObj.optJSONObject("photos")
                     if (photosNode != null) {
                         val keys = photosNode.keys()
@@ -573,56 +930,43 @@ class MainActivity : AppCompatActivity() {
                     }
                 } catch (_: Exception) {}
 
-                // 3. Fetch user favorites
+                var favRaw = ""
                 val favSet = mutableSetOf<String>()
                 try {
-                    val favRaw = httpGet(getApiEndpoint("favorites", "username=" + URLEncoder.encode(currentUsername, "UTF-8")))
-                    val favArr = JSONArray(favRaw)
-                    for (i in 0 until favArr.length()) {
-                        favSet.add(favArr.optString(i))
-                    }
+                    favRaw = httpGet(getApiEndpoint("favorites", "username=" + URLEncoder.encode(currentUsername, "UTF-8")))
+                    val favArr = JSONArray(extractJsonPayload(favRaw))
+                    for (i in 0 until favArr.length()) favSet.add(favArr.optString(i))
                 } catch (_: Exception) {}
 
-                // 4. Fetch playlists
+                var plRaw = ""
                 val plList = mutableListOf<PlaylistGroup>()
                 try {
-                    val plRaw = httpGet(getApiEndpoint("playlists", "username=" + URLEncoder.encode(currentUsername, "UTF-8")))
-                    val plArr = JSONArray(plRaw)
+                    plRaw = httpGet(getApiEndpoint("playlists", "username=" + URLEncoder.encode(currentUsername, "UTF-8")))
+                    val plArr = JSONArray(extractJsonPayload(plRaw))
                     for (i in 0 until plArr.length()) {
                         val o = plArr.optJSONObject(i) ?: continue
                         val tIds = mutableListOf<String>()
                         val tArr = o.optJSONArray("trackIds")
                         if (tArr != null) {
-                            for (j in 0 until tArr.length()) {
-                                tIds.add(tArr.optString(j))
-                            }
+                            for (j in 0 until tArr.length()) tIds.add(tArr.optString(j))
                         }
-                        plList.add(
-                            PlaylistGroup(
-                                id = o.optString("id"),
-                                name = o.optString("name", "Playlist"),
-                                trackIds = tIds
-                            )
-                        )
+                        plList.add(PlaylistGroup(o.optString("id"), o.optString("name", "Playlist"), tIds))
                     }
                 } catch (_: Exception) {}
 
-                // 5. Fetch radio stations
+                var radRaw = ""
                 val radList = mutableListOf<RadioStation>()
                 try {
-                    val radRaw = httpGet(getApiEndpoint("radios"))
-                    val radArr = JSONArray(radRaw)
+                    radRaw = httpGet(getApiEndpoint("radios"))
+                    val radArr = JSONArray(extractJsonPayload(radRaw))
                     for (i in 0 until radArr.length()) {
                         val o = radArr.optJSONObject(i) ?: continue
-                        radList.add(
-                            RadioStation(
-                                id = o.optString("id", "$i"),
-                                name = o.optString("name", "Rádio"),
-                                streamUrl = o.optString("url", "")
-                            )
-                        )
+                        radList.add(RadioStation(o.optString("id", "$i"), o.optString("name", "Rádio"), o.optString("url", "")))
                     }
                 } catch (_: Exception) {}
+
+                // Save catalog JSONs locally on phone so offline mode works anytime
+                saveOfflineCatalogToDisk(tracksRaw, photosRaw, favRaw, plRaw, radRaw)
 
                 mainHandler.post {
                     allTracks.clear()
@@ -635,19 +979,47 @@ class MainActivity : AppCompatActivity() {
                     playlists.addAll(plList)
                     radioStations.clear()
                     radioStations.addAll(radList)
+                    rebuildPodcastShowsFromTracks()
 
-                    val musicCount = allTracks.count { !isPodcastTrack(it) }
-                    topHeaderStatus.text = "Conectado ($currentUsername) • $musicCount músicas na API"
-                    topHeaderStatus.setTextColor(Color.parseColor("#34d399"))
+                    isServerReachable = true
+                    updateHeaderStatusUI()
                     renderCurrentTab()
+
+                    if (triggerToast) {
+                        Toast.makeText(this, "Sincronização concluída! Salvando músicas no armazenamento local...", Toast.LENGTH_SHORT).show()
+                    }
+                    // Automatically download all tracks locally within the user's storage limit
+                    startAutoOfflineDownloadWorker(false)
                 }
             } catch (e: Exception) {
                 mainHandler.post {
-                    topHeaderStatus.text = "Erro na API: toque em ⚙ API / Login para configurar URL"
-                    topHeaderStatus.setTextColor(Color.parseColor("#f87171"))
-                    renderErrorState(e.message ?: "Falha de conexão com $serverBaseUrl/api.php")
+                    isServerReachable = false
+                    loadOfflineCatalogFromDisk()
+                    updateHeaderStatusUI()
+                    renderCurrentTab()
+                    if (triggerToast) {
+                        Toast.makeText(this, "Sem conexão com o servidor. Exibindo músicas salvas offline.", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
+        }
+    }
+
+    private fun rebuildPodcastShowsFromTracks() {
+        val podTracks = allTracks.filter { isPodcastTrack(it) }
+        val grouped = podTracks.groupBy { it.album.ifEmpty { "Podcast" } }
+        podcastShows.clear()
+        for ((showName, eps) in grouped) {
+            val first = eps.first()
+            val cover = eps.firstOrNull { it.coverUrl.isNotEmpty() }?.coverUrl ?: ""
+            podcastShows.add(
+                PodcastShow(
+                    name = showName,
+                    author = first.artist.ifEmpty { showName },
+                    coverUrl = cover,
+                    episodes = eps
+                )
+            )
         }
     }
 
@@ -664,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
                     title = o.optString("title", "Sem Título"),
                     artist = o.optString("artist", "Artista Desconhecido").trim().ifEmpty { "Artista Desconhecido" },
                     album = o.optString("album", "Single").trim().ifEmpty { "Single" },
-                    genre = o.optString("genre", " Geral"),
+                    genre = o.optString("genre", "Geral"),
                     duration = o.optInt("duration", 0),
                     coverUrl = resolveMediaUrl(rawCover),
                     albumYear = o.optString("album_year", o.optString("year", "")),
@@ -690,33 +1062,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun httpGet(urlStr: String): String {
-        val url = URL(urlStr)
-        val conn = (url.openConnection() as HttpURLConnection).apply {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 8000
             readTimeout = 10000
             setRequestProperty("Accept", "application/json")
             setRequestProperty("X-Username", currentUsername)
-            setRequestProperty("User-Agent", "PHPlayerAndroidAPI/1.3")
+            setRequestProperty("User-Agent", "PHPlayerAndroidAPI/1.4")
         }
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
         val reader = BufferedReader(InputStreamReader(stream))
         val sb = StringBuilder()
         var line: String?
-        while (reader.readLine().also { line = it } != null) {
-            sb.append(line)
-        }
+        while (reader.readLine().also { line = it } != null) sb.append(line)
         reader.close()
-        if (code !in 200..299) {
-            throw Exception("HTTP $code: $sb")
-        }
+        if (code !in 200..299) throw Exception("HTTP $code")
         return sb.toString()
     }
 
     private fun httpPostJson(urlStr: String, payload: JSONObject): String {
-        val url = URL(urlStr)
-        val conn = (url.openConnection() as HttpURLConnection).apply {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 8000
             readTimeout = 10000
@@ -724,7 +1090,7 @@ class MainActivity : AppCompatActivity() {
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             setRequestProperty("Accept", "application/json")
             setRequestProperty("X-Username", currentUsername)
-            setRequestProperty("User-Agent", "PHPlayerAndroidAPI/1.3")
+            setRequestProperty("User-Agent", "PHPlayerAndroidAPI/1.4")
         }
         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
             writer.write(payload.toString())
@@ -735,13 +1101,9 @@ class MainActivity : AppCompatActivity() {
         val reader = BufferedReader(InputStreamReader(stream))
         val sb = StringBuilder()
         var line: String?
-        while (reader.readLine().also { line = it } != null) {
-            sb.append(line)
-        }
+        while (reader.readLine().also { line = it } != null) sb.append(line)
         reader.close()
-        if (code !in 200..299) {
-            throw Exception("HTTP $code: $sb")
-        }
+        if (code !in 200..299) throw Exception("HTTP $code")
         return sb.toString()
     }
 
@@ -751,6 +1113,11 @@ class MainActivity : AppCompatActivity() {
     private fun renderCurrentTab() {
         contentContainer.removeAllViews()
 
+        // Show Offline Mode Banner at the top of content tabs when offline
+        if (isOfflineModeActive() && currentTab != "settings") {
+            contentContainer.addView(buildOfflineBannerCard())
+        }
+
         if (selectedAlbumFilter != null) {
             renderAlbumDetailView(selectedAlbumFilter!!)
             return
@@ -759,46 +1126,76 @@ class MainActivity : AppCompatActivity() {
             renderArtistDetailView(selectedArtistFilter!!)
             return
         }
+        if (selectedPodcastFilter != null) {
+            renderPodcastDetailView(selectedPodcastFilter!!)
+            return
+        }
 
         when (currentTab) {
             "albums" -> renderAlbumsTab()
             "artists" -> renderArtistsTab()
-            "tracks" -> renderTracksTab()
             "playlists" -> renderPlaylistsTab()
-            "radios" -> renderRadiosAndPodcastsTab()
+            "radios" -> renderRadiosTab()
+            "podcasts" -> renderPodcastsTab()
+            "settings" -> renderSettingsTab()
         }
     }
 
-    private fun renderErrorState(errorMsg: String) {
-        contentContainer.removeAllViews()
-        val card = LinearLayout(this).apply {
+    private fun buildOfflineBannerCard(): View {
+        val offlineTracks = allTracks.filter { !isPodcastTrack(it) && isTrackStoredOffline(it.id) }
+        val banner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-            background = roundedBox("#111827", "#dc2626", 14)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedBox("#1c1917", "#f59e0b", 16)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
         }
+
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
         val title = TextView(this).apply {
-            text = "Não foi possível conectar à API do Servidor PHP"
-            setTextColor(Color.parseColor("#f87171"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            text = "📴 MODO OFFLINE ATIVO"
+            setTextColor(Color.parseColor("#fbbf24"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
         }
-        val desc = TextView(this).apply {
-            text = "URL atual: $serverBaseUrl/api.php\nDetalhe: $errorMsg\n\nVerifique se o endereço do servidor PHP está correto e acessível na sua rede ou internet."
-            setTextColor(Color.parseColor("#cbd5e1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(8), 0, dp(14))
+        val sub = TextView(this).apply {
+            text = "${offlineTracks.size} músicas armazenadas no celular prontas para tocar sem internet."
+            setTextColor(Color.parseColor("#e7e5e4"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
         }
-        val cfgBtn = createPillButton("⚙ Configurar URL do Servidor PHP", "#0284c7", "#ffffff") {
-            showApiConfigDialog()
+        titleCol.addView(title)
+        titleCol.addView(sub)
+
+        val playOfflineBtn = createModernButton("▶ Tocar Offline", "#f59e0b", "#090d16", 12) {
+            if (offlineTracks.isNotEmpty()) {
+                startPlaybackQueue(offlineTracks.shuffled(), 0)
+            } else {
+                Toast.makeText(this, "Nenhuma música baixada ainda. Conecte-se e sincronize na aba Config.", Toast.LENGTH_SHORT).show()
+            }
         }
-        card.addView(title)
-        card.addView(desc)
-        card.addView(cfgBtn)
-        contentContainer.addView(card)
+
+        topRow.addView(titleCol)
+        topRow.addView(playOfflineBtn)
+        banner.addView(topRow)
+        return banner
     }
 
+    // -------------------------------------------------------------------------
+    // 1. ALBUMS TAB
+    // -------------------------------------------------------------------------
     private fun renderAlbumsTab() {
-        val musicTracks = allTracks.filter { !isPodcastTrack(it) }
+        val musicTracks = getVisibleMusicTracks()
         val filtered = if (searchQuery.isEmpty()) musicTracks else musicTracks.filter {
             it.title.contains(searchQuery, true) ||
                 it.artist.contains(searchQuery, true) ||
@@ -824,20 +1221,19 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // Top action bar
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, dp(2), 0, dp(12))
         }
         val countTxt = TextView(this).apply {
-            text = "ÁLBUNS NA BIBLIOTECA (${albums.size})"
+            text = if (isOfflineModeActive()) "ÁLBUNS OFFLINE (${albums.size})" else "ÁLBUNS (${albums.size})"
             setTextColor(Color.parseColor("#94a3b8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val randAlbumBtn = createPillButton("🎲 Álbum Aleatório", "#1e293b", "#38bdf8") {
+        val randAlbumBtn = createModernButton("🎲 Álbum Aleatório", "#1e293b", "#38bdf8", 12) {
             if (albums.isNotEmpty()) {
                 val chosen = albums[Random.nextInt(albums.size)]
                 startPlaybackQueue(chosen.tracks, 0)
@@ -848,7 +1244,12 @@ class MainActivity : AppCompatActivity() {
         contentContainer.addView(headerRow)
 
         if (albums.isEmpty()) {
-            contentContainer.addView(emptyLabel("Nenhum álbum encontrado."))
+            val msg = if (isOfflineModeActive()) {
+                "Nenhuma música offline encontrada no celular.\nVá até a aba ⚙ Config e toque em Sincronizar quando estiver conectado."
+            } else {
+                "Nenhum álbum encontrado."
+            }
+            contentContainer.addView(emptyLabel(msg))
             return
         }
 
@@ -858,25 +1259,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun createAlbumRowCard(alb: AlbumGroup): View {
+        val offlineCount = alb.tracks.count { isTrackStoredOffline(it.id) }
+        val allOffline = offlineCount == alb.tracks.size && alb.tracks.isNotEmpty()
+
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            background = roundedBox("#0f172a", "#1e293b", 12)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = roundedBox("#0d1324", "#1e293b", 16)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
+            ).apply { bottomMargin = dp(10) }
             setOnClickListener {
                 selectedAlbumFilter = alb
                 renderCurrentTab()
             }
         }
 
-        val img = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#1e293b"))
+        val img = createRoundedImageView(dp(60), 12).apply {
+            (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(14)
         }
         loadImageAsync(alb.coverUrl, img)
 
@@ -896,8 +1298,9 @@ class MainActivity : AppCompatActivity() {
 
         val sub = TextView(this).apply {
             val yr = if (alb.year.isNotEmpty()) " • ${alb.year}" else ""
-            text = "${alb.artist}$yr • ${alb.tracks.size} faixas"
-            setTextColor(Color.parseColor("#94a3b8"))
+            val offTag = if (allOffline) " • ✓ Offline" else if (offlineCount > 0) " • $offlineCount/${alb.tracks.size} Offline" else ""
+            text = "${alb.artist}$yr • ${alb.tracks.size} faixas$offTag"
+            setTextColor(if (allOffline) Color.parseColor("#34d399") else Color.parseColor("#94a3b8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
@@ -906,10 +1309,10 @@ class MainActivity : AppCompatActivity() {
         infoCol.addView(title)
         infoCol.addView(sub)
 
-        val playBtn = createPillButton("▶", "#0284c7", "#ffffff") {
+        val playBtn = createModernButton("▶", "#0ea5e9", "#ffffff", 12) {
             startPlaybackQueue(alb.tracks, 0)
         }
-        val shuffleBtn = createPillButton("🔀", "#1e293b", "#38bdf8") {
+        val shuffleBtn = createModernButton("🔀", "#1e293b", "#38bdf8", 12) {
             startPlaybackQueue(alb.tracks.shuffled(), 0)
         }.apply {
             (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6)
@@ -923,29 +1326,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderAlbumDetailView(alb: AlbumGroup) {
-        val backBtn = createPillButton("← Voltar", "#1e293b", "#38bdf8") {
+        val backBtn = createModernButton("← Voltar aos Álbuns", "#1e293b", "#38bdf8", 12) {
             selectedAlbumFilter = null
             renderCurrentTab()
         }.apply {
-            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(10)
+            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(12)
         }
         contentContainer.addView(backBtn)
 
         val headerCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = roundedBox("#111827", "#1e293b", 14)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox("#0d1324", "#1e293b", 18)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(14) }
         }
 
-        val cover = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(80), dp(80)).apply { rightMargin = dp(14) }
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#1e293b"))
+        val cover = createRoundedImageView(dp(86), 14).apply {
+            (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(16)
         }
         loadImageAsync(alb.coverUrl, cover)
 
@@ -957,7 +1358,7 @@ class MainActivity : AppCompatActivity() {
         val albTitle = TextView(this).apply {
             text = alb.name
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             typeface = Typeface.DEFAULT_BOLD
         }
         val albArtist = TextView(this).apply {
@@ -972,12 +1373,12 @@ class MainActivity : AppCompatActivity() {
         }
         val actionsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(10), 0, 0)
         }
-        val playAll = createPillButton("▶ Tocar Álbum", "#0284c7", "#ffffff") {
+        val playAll = createModernButton("▶ Reproduzir", "#0ea5e9", "#ffffff", 12) {
             startPlaybackQueue(alb.tracks, 0)
         }
-        val shufAll = createPillButton("🔀 Aleatório", "#1e293b", "#38bdf8") {
+        val shufAll = createModernButton("🔀 Aleatório", "#1e293b", "#38bdf8", 12) {
             startPlaybackQueue(alb.tracks.shuffled(), 0)
         }.apply {
             (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8)
@@ -998,8 +1399,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // 2. ARTISTS TAB
+    // -------------------------------------------------------------------------
     private fun renderArtistsTab() {
-        val musicTracks = allTracks.filter { !isPodcastTrack(it) }
+        val musicTracks = getVisibleMusicTracks()
         val grouped = linkedMapOf<String, MutableList<TrackItem>>()
         for (t in musicTracks) {
             if (searchQuery.isNotEmpty() && !t.artist.contains(searchQuery, true)) continue
@@ -1021,16 +1425,16 @@ class MainActivity : AppCompatActivity() {
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, dp(2), 0, dp(12))
         }
         val titleTxt = TextView(this).apply {
-            text = "ARTISTAS (${artists.size})"
+            text = if (isOfflineModeActive()) "ARTISTAS OFFLINE (${artists.size})" else "ARTISTAS (${artists.size})"
             setTextColor(Color.parseColor("#94a3b8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val randomArtistBtn = createPillButton("🔀 Artista Aleatório", "#4f46e5", "#ffffff") {
+        val randomArtistBtn = createModernButton("🔀 Artista Aleatório", "#4f46e5", "#ffffff", 12) {
             if (artists.isNotEmpty()) {
                 val currentArt = playQueue.getOrNull(currentQueueIndex)?.artist
                 val pool = if (artists.size > 1 && currentArt != null) {
@@ -1051,25 +1455,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         for (art in artists) {
+            val offlineCount = art.tracks.count { isTrackStoredOffline(it.id) }
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-                background = roundedBox("#0f172a", "#1e293b", 12)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                background = roundedBox("#0d1324", "#1e293b", 16)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(8) }
+                ).apply { bottomMargin = dp(10) }
                 setOnClickListener {
                     selectedArtistFilter = art.name
                     renderCurrentTab()
                 }
             }
 
-            val img = ImageView(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(12) }
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                setBackgroundColor(Color.parseColor("#1e293b"))
+            val img = createRoundedImageView(dp(56), 28).apply {
+                (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(14)
             }
             loadImageAsync(art.photoUrl, img)
 
@@ -1084,17 +1487,18 @@ class MainActivity : AppCompatActivity() {
                 typeface = Typeface.DEFAULT_BOLD
             }
             val subView = TextView(this).apply {
-                text = "${art.albumsCount} álbuns • ${art.tracks.size} músicas"
+                val offInfo = if (offlineCount > 0) " • ✓ $offlineCount offline" else ""
+                text = "${art.albumsCount} álbuns • ${art.tracks.size} músicas$offInfo"
                 setTextColor(Color.parseColor("#94a3b8"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             }
             infoCol.addView(nameView)
             infoCol.addView(subView)
 
-            val playBtn = createPillButton("▶", "#0284c7", "#ffffff") {
+            val playBtn = createModernButton("▶", "#0ea5e9", "#ffffff", 12) {
                 startPlaybackQueue(art.tracks, 0)
             }
-            val shufBtn = createPillButton("🔀", "#1e293b", "#38bdf8") {
+            val shufBtn = createModernButton("🔀", "#1e293b", "#38bdf8", 12) {
                 startPlaybackQueue(art.tracks.shuffled(), 0)
             }.apply {
                 (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6)
@@ -1109,12 +1513,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderArtistDetailView(artistName: String) {
-        val artistTracks = allTracks.filter { !isPodcastTrack(it) && it.artist.equals(artistName, true) }
-        val backBtn = createPillButton("← Todos os Artistas", "#1e293b", "#38bdf8") {
+        val artistTracks = getVisibleMusicTracks().filter { it.artist.equals(artistName, true) }
+        val backBtn = createModernButton("← Todos os Artistas", "#1e293b", "#38bdf8", 12) {
             selectedArtistFilter = null
             renderCurrentTab()
         }.apply {
-            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(10)
+            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(12)
         }
         contentContainer.addView(backBtn)
 
@@ -1125,18 +1529,16 @@ class MainActivity : AppCompatActivity() {
         val bannerCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = roundedBox("#111827", "#1e293b", 14)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox("#0d1324", "#1e293b", 18)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(14) }
         }
 
-        val avatar = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(76), dp(76)).apply { rightMargin = dp(14) }
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#1e293b"))
+        val avatar = createRoundedImageView(dp(80), 40).apply {
+            (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(16)
         }
         loadImageAsync(photoUrl, avatar)
 
@@ -1147,22 +1549,23 @@ class MainActivity : AppCompatActivity() {
         val title = TextView(this).apply {
             text = artistName
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = Typeface.DEFAULT_BOLD
         }
         val sub = TextView(this).apply {
-            text = "${artistTracks.size} músicas disponíveis"
+            val offCount = artistTracks.count { isTrackStoredOffline(it.id) }
+            text = "${artistTracks.size} músicas • $offCount salvas offline"
             setTextColor(Color.parseColor("#38bdf8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
         }
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(10), 0, 0)
         }
-        btnRow.addView(createPillButton("▶ Tocar Tudo", "#0284c7", "#ffffff") {
+        btnRow.addView(createModernButton("▶ Tocar Tudo", "#0ea5e9", "#ffffff", 12) {
             startPlaybackQueue(artistTracks, 0)
         })
-        btnRow.addView(createPillButton("🔀 Shuffle", "#1e293b", "#38bdf8") {
+        btnRow.addView(createModernButton("🔀 Shuffle", "#1e293b", "#38bdf8", 12) {
             startPlaybackQueue(artistTracks.shuffled(), 0)
         }.apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8) })
 
@@ -1173,7 +1576,6 @@ class MainActivity : AppCompatActivity() {
         bannerCard.addView(col)
         contentContainer.addView(bannerCard)
 
-        // Group artist albums by type
         val albumsByName = artistTracks.groupBy { it.album }.map { (albName, list) ->
             val first = list.first()
             AlbumGroup(
@@ -1195,17 +1597,14 @@ class MainActivity : AppCompatActivity() {
         )
 
         for ((typeKey, label) in typeLabels) {
-            val matching = albumsByName.filter {
-                val norm = it.type.ifEmpty { "album" }
-                norm == typeKey
-            }
+            val matching = albumsByName.filter { (it.type.ifEmpty { "album" }) == typeKey }
             if (matching.isNotEmpty()) {
                 val secHeader = TextView(this).apply {
                     text = "$label (${matching.size})"
                     setTextColor(Color.parseColor("#38bdf8"))
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                     typeface = Typeface.DEFAULT_BOLD
-                    setPadding(0, dp(8), 0, dp(6))
+                    setPadding(0, dp(10), 0, dp(6))
                 }
                 contentContainer.addView(secHeader)
                 for (alb in matching) {
@@ -1215,71 +1614,576 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderTracksTab() {
-        val base = allTracks.filter { !isPodcastTrack(it) }
-        val favFiltered = if (showOnlyFavorites) base.filter { favoriteIds.contains(it.id) } else base
-        val tracks = if (searchQuery.isEmpty()) favFiltered else favFiltered.filter {
-            it.title.contains(searchQuery, true) ||
-                it.artist.contains(searchQuery, true) ||
-                it.album.contains(searchQuery, true)
-        }
+    // -------------------------------------------------------------------------
+    // 3. PLAYLISTS TAB (Includes Automatic Offline & Favorites Playlists)
+    // -------------------------------------------------------------------------
+    private fun renderPlaylistsTab() {
+        val visibleTracks = getVisibleMusicTracks()
 
-        val filterBar = LinearLayout(this).apply {
+        // Built-in Smart Card 1: All Offline Stored Tracks
+        val offlineTracks = allTracks.filter { !isPodcastTrack(it) && isTrackStoredOffline(it.id) }
+        val offlineSmartCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = roundedBox("#062e22", "#10b981", 16)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        val offCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        offCol.addView(TextView(this).apply {
+            text = "📥 Músicas Salvas no Celular (Offline)"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        offCol.addView(TextView(this).apply {
+            text = "${offlineTracks.size} músicas disponíveis sem internet • ${formatBytes(getUsedOfflineAudioBytes())}"
+            setTextColor(Color.parseColor("#6ee7b7"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        })
+        val playOffBtn = createModernButton("▶ Tocar", "#10b981", "#052e16", 12) {
+            if (offlineTracks.isNotEmpty()) startPlaybackQueue(offlineTracks, 0)
+        }
+        val shufOffBtn = createModernButton("🔀", "#064e3b", "#6ee7b7", 12) {
+            if (offlineTracks.isNotEmpty()) startPlaybackQueue(offlineTracks.shuffled(), 0)
+        }.apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6) }
+        offlineSmartCard.addView(offCol)
+        offlineSmartCard.addView(playOffBtn)
+        offlineSmartCard.addView(shufOffBtn)
+        contentContainer.addView(offlineSmartCard)
+
+        // Built-in Smart Card 2: Favorites
+        val favTracks = visibleTracks.filter { favoriteIds.contains(it.id) }
+        val favSmartCard = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = roundedBox("#2a0a18", "#f43f5e", 16)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+        val favCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        favCol.addView(TextView(this).apply {
+            text = "♥ Minhas Favoritas"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        favCol.addView(TextView(this).apply {
+            text = "${favTracks.size} músicas favoritas disponíveis"
+            setTextColor(Color.parseColor("#fda4af"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        })
+        favSmartCard.addView(favCol)
+        favSmartCard.addView(createModernButton("▶ Tocar", "#e11d48", "#ffffff", 12) {
+            if (favTracks.isNotEmpty()) startPlaybackQueue(favTracks, 0)
+        })
+        contentContainer.addView(favSmartCard)
+
+        val header = TextView(this).apply {
+            text = "PLAYLISTS DO SERVIDOR (${playlists.size})"
+            setTextColor(Color.parseColor("#94a3b8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
             setPadding(0, 0, 0, dp(10))
         }
-        val allBtn = createPillButton(
-            "Todas (${base.size})",
-            if (!showOnlyFavorites) "#0284c7" else "#1e293b",
-            "#ffffff"
-        ) {
-            showOnlyFavorites = false
-            renderCurrentTab()
-        }
-        val favBtn = createPillButton(
-            "♥ Favoritas (${favoriteIds.size})",
-            if (showOnlyFavorites) "#e11d48" else "#1e293b",
-            "#ffffff"
-        ) {
-            showOnlyFavorites = true
-            renderCurrentTab()
-        }.apply {
-            (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8)
-        }
+        contentContainer.addView(header)
 
-        filterBar.addView(allBtn)
-        filterBar.addView(favBtn)
-        contentContainer.addView(filterBar)
-
-        if (tracks.isEmpty()) {
-            contentContainer.addView(emptyLabel("Nenhuma música encontrada."))
+        if (playlists.isEmpty()) {
+            contentContainer.addView(emptyLabel("Nenhuma playlist personalizada encontrada."))
             return
         }
 
-        val displayList = tracks.take(150)
-        displayList.forEachIndexed { idx, track ->
-            contentContainer.addView(createTrackRow(track, tracks, idx))
+        for (pl in playlists) {
+            val plTracks = visibleTracks.filter { pl.trackIds.contains(it.id) }
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), dp(14), dp(14), dp(14))
+                background = roundedBox("#0d1324", "#1e293b", 16)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(10) }
+            }
+
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            col.addView(TextView(this).apply {
+                text = "📂 ${pl.name}"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            col.addView(TextView(this).apply {
+                val offCnt = plTracks.count { isTrackStoredOffline(it.id) }
+                text = "${plTracks.size} músicas ($offCnt salvas offline)"
+                setTextColor(Color.parseColor("#94a3b8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            })
+
+            val playBtn = createModernButton("▶ Tocar", "#0ea5e9", "#ffffff", 12) {
+                if (plTracks.isNotEmpty()) startPlaybackQueue(plTracks, 0)
+            }
+            val shufBtn = createModernButton("🔀", "#1e293b", "#38bdf8", 12) {
+                if (plTracks.isNotEmpty()) startPlaybackQueue(plTracks.shuffled(), 0)
+            }.apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6) }
+
+            card.addView(col)
+            card.addView(playBtn)
+            card.addView(shufBtn)
+            contentContainer.addView(card)
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. RADIOS TAB
+    // -------------------------------------------------------------------------
+    private fun renderRadiosTab() {
+        val radHeader = TextView(this).apply {
+            text = "📻 ESTAÇÕES DE RÁDIO ON-LINE (${radioStations.size})"
+            setTextColor(Color.parseColor("#38bdf8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(2), 0, dp(10))
+        }
+        contentContainer.addView(radHeader)
+
+        if (radioStations.isEmpty()) {
+            contentContainer.addView(emptyLabel("Nenhuma estação de rádio cadastrada."))
+            return
+        }
+
+        for (rad in radioStations) {
+            if (searchQuery.isNotEmpty() && !rad.name.contains(searchQuery, true)) continue
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), dp(14), dp(14), dp(14))
+                background = roundedBox("#0d1324", "#1e293b", 16)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(10) }
+                setOnClickListener {
+                    if (isOfflineModeActive()) {
+                        Toast.makeText(this@MainActivity, "Rádios ao vivo exigem conexão com a internet.", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    val radioTrack = TrackItem(
+                        id = "radio-${rad.id}",
+                        title = rad.name,
+                        artist = "Rádio Ao Vivo",
+                        album = "Streaming",
+                        genre = "Radio",
+                        duration = 0,
+                        coverUrl = "",
+                        albumYear = "",
+                        albumType = "radio",
+                        trackNumber = 0,
+                        fileName = rad.streamUrl
+                    )
+                    startPlaybackQueue(listOf(radioTrack), 0)
+                }
+            }
+            val nameTxt = TextView(this).apply {
+                text = "📻 ${rad.name}"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val playBtn = createModernButton("▶ Sintonizar", "#10b981", "#052e16", 12) {
+                card.performClick()
+            }
+            card.addView(nameTxt)
+            card.addView(playBtn)
+            contentContainer.addView(card)
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. DEDICATED PODCASTS TAB
+    // -------------------------------------------------------------------------
+    private fun renderPodcastsTab() {
+        val visiblePodTracks = getVisiblePodcastTracks()
+        val showsMap = visiblePodTracks.groupBy { it.album.ifEmpty { "Podcast" } }
+        val shows = showsMap.entries.map { (name, eps) ->
+            val first = eps.first()
+            PodcastShow(
+                name = name,
+                author = first.artist.ifEmpty { name },
+                coverUrl = eps.firstOrNull { it.coverUrl.isNotEmpty() }?.coverUrl ?: "",
+                episodes = eps
+            )
+        }.filter {
+            searchQuery.isEmpty() || it.name.contains(searchQuery, true) || it.author.contains(searchQuery, true)
+        }
+
+        val header = TextView(this).apply {
+            text = if (isOfflineModeActive()) "🎙 PODCASTS OFFLINE (${shows.size} programas)" else "🎙 PROGRAMAS DE PODCAST (${shows.size})"
+            setTextColor(Color.parseColor("#c084fc"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(2), 0, dp(12))
+        }
+        contentContainer.addView(header)
+
+        if (shows.isEmpty()) {
+            contentContainer.addView(emptyLabel("Nenhum episódio de podcast disponível."))
+            return
+        }
+
+        for (show in shows) {
+            val offEps = show.episodes.count { isTrackStoredOffline(it.id) }
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                background = roundedBox("#0d1324", "#2e1065", 16)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(10) }
+                setOnClickListener {
+                    selectedPodcastFilter = show
+                    renderCurrentTab()
+                }
+            }
+
+            val cover = createRoundedImageView(dp(60), 12).apply {
+                (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(14)
+            }
+            loadImageAsync(show.coverUrl, cover)
+
+            val infoCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            infoCol.addView(TextView(this).apply {
+                text = show.name
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            infoCol.addView(TextView(this).apply {
+                text = "${show.episodes.size} episódios • $offEps offline"
+                setTextColor(Color.parseColor("#c084fc"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            })
+
+            val playBtn = createModernButton("▶ Ouvir", "#9333ea", "#ffffff", 12) {
+                startPlaybackQueue(show.episodes, 0)
+            }
+
+            card.addView(cover)
+            card.addView(infoCol)
+            card.addView(playBtn)
+            contentContainer.addView(card)
+        }
+    }
+
+    private fun renderPodcastDetailView(show: PodcastShow) {
+        val backBtn = createModernButton("← Voltar aos Podcasts", "#1e293b", "#c084fc", 12) {
+            selectedPodcastFilter = null
+            renderCurrentTab()
+        }.apply {
+            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(12)
+        }
+        contentContainer.addView(backBtn)
+
+        val title = TextView(this).apply {
+            text = "🎙 ${show.name} (${show.episodes.size} episódios)"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(10))
+        }
+        contentContainer.addView(title)
+
+        show.episodes.forEachIndexed { idx, ep ->
+            contentContainer.addView(createTrackRow(ep, show.episodes, idx))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. DEDICATED SETTINGS TAB (API/Login, Sync, Offline Storage Quota)
+    // -------------------------------------------------------------------------
+    private fun renderSettingsTab() {
+        val pageTitle = TextView(this).apply {
+            text = "⚙ CONFIGURAÇÕES & ARMAZENAMENTO OFFLINE"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(4), 0, dp(14))
+        }
+        contentContainer.addView(pageTitle)
+
+        // CARD 1: API / LOGIN & SYNC
+        val apiCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox("#0d1324", "#1e293b", 18)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+
+        apiCard.addView(TextView(this).apply {
+            text = "🔗 Conexão API & Sincronização"
+            setTextColor(Color.parseColor("#38bdf8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+
+        apiCard.addView(TextView(this).apply {
+            text = "Servidor: $serverBaseUrl\nUsuário autenticado: $currentUsername ($currentRole)"
+            setTextColor(Color.parseColor("#cbd5e1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(6), 0, dp(12))
+        })
+
+        val apiBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val btnApiLogin = createModernButton("🔑 API / Login", "#0284c7", "#ffffff", 12) {
+            showApiConfigDialog()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) }
+            gravity = Gravity.CENTER
+        }
+
+        val btnSyncNow = createModernButton("🔄 Sync Biblioteca", "#10b981", "#052e16", 12) {
+            forceOfflineMode = false
+            prefs.edit().putBoolean(KEY_FORCE_OFFLINE, false).apply()
+            syncAllFromApi(true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.CENTER
+        }
+
+        apiBtnRow.addView(btnApiLogin)
+        apiBtnRow.addView(btnSyncNow)
+        apiCard.addView(apiBtnRow)
+        contentContainer.addView(apiCard)
+
+        // CARD 2: OFFLINE STORAGE QUOTA & LOCAL DOWNLOADS
+        val storageCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox("#0d1324", "#10b981", 18)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
+        }
+
+        storageCard.addView(TextView(this).apply {
+            text = "💾 Espaço para Músicas Offline no Celular"
+            setTextColor(Color.parseColor("#34d399"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+
+        val usedBytes = getUsedOfflineAudioBytes()
+        val freePhoneBytes = getDeviceFreeBytes()
+        val offlineCount = getOfflineTracksCount()
+        val totalMusicCount = allTracks.count { !isPodcastTrack(it) }
+        val limitText = if (maxOfflineStorageMB <= 0L) "Ilimitado" else formatBytes(maxOfflineStorageMB * 1024L * 1024L)
+
+        storageCard.addView(TextView(this).apply {
+            text = "Usado pelo App: ${formatBytes(usedBytes)} de $limitText\n" +
+                "Músicas salvas localmente: $offlineCount de $totalMusicCount faixas\n" +
+                "Espaço livre disponível no celular: ${formatBytes(freePhoneBytes)}"
+            setTextColor(Color.parseColor("#e2e8f0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(8), 0, dp(10))
+        })
+
+        if (downloadedSyncProgressText.isNotEmpty()) {
+            storageCard.addView(TextView(this).apply {
+                text = downloadedSyncProgressText
+                setTextColor(Color.parseColor("#38bdf8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(0, 0, 0, dp(10))
+            })
+        }
+
+        // Visual progress bar of storage used
+        val progressPercent = if (maxOfflineStorageMB <= 0L) {
+            if (totalMusicCount > 0) ((offlineCount * 100) / totalMusicCount).coerceIn(0, 100) else 0
+        } else {
+            val maxB = maxOfflineStorageMB * 1024L * 1024L
+            ((usedBytes * 100L) / maxB).toInt().coerceIn(0, 100)
+        }
+
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = progressPercent
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10)).apply {
+                bottomMargin = dp(14)
+            }
+        }
+        storageCard.addView(progressBar)
+
+        storageCard.addView(TextView(this).apply {
+            text = "Escolha quanto espaço do celular usar para armazenar as músicas offline:"
+            setTextColor(Color.parseColor("#94a3b8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, 0, 0, dp(8))
+        })
+
+        val quotaOptions = listOf(
+            512L to "512 MB",
+            1024L to "1 GB",
+            2048L to "2 GB",
+            5120L to "5 GB",
+            10240L to "10 GB",
+            0L to "Ilimitado"
+        )
+
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        }
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(12)
+            }
+        }
+
+        quotaOptions.forEachIndexed { index, (mbVal, label) ->
+            val isSelected = maxOfflineStorageMB == mbVal
+            val btn = createModernButton(
+                if (isSelected) "✓ $label" else label,
+                if (isSelected) "#10b981" else "#162038",
+                if (isSelected) "#052e16" else "#cbd5e1",
+                10
+            ) {
+                maxOfflineStorageMB = mbVal
+                prefs.edit().putLong(KEY_MAX_OFFLINE_MB, mbVal).apply()
+                enforceStorageQuotaIfNeeded()
+                renderCurrentTab()
+                startAutoOfflineDownloadWorker(true)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (index % 3 != 2) rightMargin = dp(6)
+                }
+                gravity = Gravity.CENTER
+            }
+            if (index < 3) row1.addView(btn) else row2.addView(btn)
+        }
+
+        storageCard.addView(row1)
+        storageCard.addView(row2)
+
+        val storageActionsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val downloadAllNowBtn = createModernButton("⬇ Baixar Todas as Músicas", "#0ea5e9", "#ffffff", 12) {
+            startAutoOfflineDownloadWorker(true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) }
+            gravity = Gravity.CENTER
+        }
+
+        val clearCacheBtn = createModernButton("🗑 Limpar Offline", "#7f1d1d", "#fecaca", 12) {
+            AlertDialog.Builder(this)
+                .setTitle("Limpar músicas offline?")
+                .setMessage("Isso removerá os arquivos MP3 salvos no celular. Você poderá baixá-los novamente ao sincronizar.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Limpar") { _, _ ->
+                    getAudioCacheDir().listFiles()?.forEach { it.delete() }
+                    downloadedSyncProgressText = ""
+                    updateHeaderStatusUI()
+                    renderCurrentTab()
+                }
+                .show()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
+        storageActionsRow.addView(downloadAllNowBtn)
+        storageActionsRow.addView(clearCacheBtn)
+        storageCard.addView(storageActionsRow)
+        contentContainer.addView(storageCard)
+
+        // CARD 3: OFFLINE MODE SWITCH & EQUALIZER
+        val extraCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox("#0d1324", "#1e293b", 18)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val offlineSwitch = Switch(this).apply {
+            text = "Modo Somente Offline (Exibir e tocar apenas músicas salvas no celular)"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = forceOfflineMode
+            setPadding(0, 0, 0, dp(12))
+            setOnCheckedChangeListener { _, isChecked ->
+                forceOfflineMode = isChecked
+                prefs.edit().putBoolean(KEY_FORCE_OFFLINE, isChecked).apply()
+                updateHeaderStatusUI()
+                renderCurrentTab()
+            }
+        }
+        extraCard.addView(offlineSwitch)
+
+        val eqBtn = createModernButton("🎚 Abrir Equalizador de Áudio Nativo", "#1e293b", "#38bdf8", 12) {
+            showEqualizerDialog()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            gravity = Gravity.CENTER
+        }
+        extraCard.addView(eqBtn)
+        contentContainer.addView(extraCard)
     }
 
     private fun createTrackRow(track: TrackItem, queueContext: List<TrackItem>, indexInQueue: Int): View {
         val isCurrent = playQueue.getOrNull(currentQueueIndex)?.id == track.id
         val isFav = favoriteIds.contains(track.id)
+        val isOffline = isTrackStoredOffline(track.id)
 
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setPadding(dp(12), dp(11), dp(12), dp(11))
             background = roundedBox(
-                if (isCurrent) "#172554" else "#0f172a",
+                if (isCurrent) "#132347" else "#0d1324",
                 if (isCurrent) "#38bdf8" else "#1e293b",
-                10
+                14
             )
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(6) }
+            ).apply { bottomMargin = dp(8) }
             setOnClickListener {
                 startPlaybackQueue(queueContext, indexInQueue)
             }
@@ -1299,8 +2203,9 @@ class MainActivity : AppCompatActivity() {
             ellipsize = TextUtils.TruncateAt.END
         }
         val sub = TextView(this).apply {
-            text = "${track.artist} • ${track.album}"
-            setTextColor(Color.parseColor("#94a3b8"))
+            val badge = if (isOffline) " • ✓ Offline" else ""
+            text = "${track.artist} • ${track.album}$badge"
+            setTextColor(if (isOffline) Color.parseColor("#34d399") else Color.parseColor("#94a3b8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
@@ -1324,152 +2229,17 @@ class MainActivity : AppCompatActivity() {
         return row
     }
 
-    private fun renderPlaylistsTab() {
-        val header = TextView(this).apply {
-            text = "PLAYLISTS DO SERVIDOR (${playlists.size})"
-            setTextColor(Color.parseColor("#94a3b8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(10))
-        }
-        contentContainer.addView(header)
-
-        if (playlists.isEmpty()) {
-            contentContainer.addView(emptyLabel("Nenhuma playlist cadastrada no servidor."))
-            return
-        }
-
-        for (pl in playlists) {
-            val plTracks = allTracks.filter { pl.trackIds.contains(it.id) }
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-                background = roundedBox("#0f172a", "#1e293b", 12)
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(8) }
-            }
-
-            val col = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            val nameTxt = TextView(this).apply {
-                text = "📂 ${pl.name}"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                typeface = Typeface.DEFAULT_BOLD
-            }
-            val countTxt = TextView(this).apply {
-                text = "${plTracks.size} músicas"
-                setTextColor(Color.parseColor("#94a3b8"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            }
-            col.addView(nameTxt)
-            col.addView(countTxt)
-
-            val playBtn = createPillButton("▶ Tocar", "#0284c7", "#ffffff") {
-                if (plTracks.isNotEmpty()) startPlaybackQueue(plTracks, 0)
-            }
-            val shufBtn = createPillButton("🔀", "#1e293b", "#38bdf8") {
-                if (plTracks.isNotEmpty()) startPlaybackQueue(plTracks.shuffled(), 0)
-            }.apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(6) }
-
-            card.addView(col)
-            card.addView(playBtn)
-            card.addView(shufBtn)
-            contentContainer.addView(card)
-        }
-    }
-
-    private fun renderRadiosAndPodcastsTab() {
-        val radHeader = TextView(this).apply {
-            text = "📻 RÁDIOS ON-LINE (${radioStations.size})"
-            setTextColor(Color.parseColor("#38bdf8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(8))
-        }
-        contentContainer.addView(radHeader)
-
-        if (radioStations.isEmpty()) {
-            contentContainer.addView(emptyLabel("Nenhuma rádio cadastrada."))
-        } else {
-            for (rad in radioStations) {
-                val card = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(12), dp(12), dp(12), dp(12))
-                    background = roundedBox("#0f172a", "#1e293b", 12)
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { bottomMargin = dp(6) }
-                    setOnClickListener {
-                        val radioTrack = TrackItem(
-                            id = "radio-${rad.id}",
-                            title = rad.name,
-                            artist = "Rádio On-line",
-                            album = "Ao Vivo",
-                            genre = "Radio",
-                            duration = 0,
-                            coverUrl = "",
-                            albumYear = "",
-                            albumType = "radio",
-                            trackNumber = 0,
-                            fileName = rad.streamUrl
-                        )
-                        startPlaybackQueue(listOf(radioTrack), 0)
-                    }
-                }
-                val nameTxt = TextView(this).apply {
-                    text = "📻 ${rad.name}"
-                    setTextColor(Color.WHITE)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                    typeface = Typeface.DEFAULT_BOLD
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                }
-                val playBtn = createPillButton("▶ Ouvir", "#10b981", "#052e16") {
-                    card.performClick()
-                }
-                card.addView(nameTxt)
-                card.addView(playBtn)
-                contentContainer.addView(card)
-            }
-        }
-
-        val podcastTracks = allTracks.filter { isPodcastTrack(it) }
-        val podHeader = TextView(this).apply {
-            text = "🎙 PODCASTS (${podcastTracks.size} episódios)"
-            setTextColor(Color.parseColor("#a855f7"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(16), 0, dp(8))
-        }
-        contentContainer.addView(podHeader)
-
-        if (podcastTracks.isEmpty()) {
-            contentContainer.addView(emptyLabel("Nenhum episódio de podcast encontrado."))
-        } else {
-            podcastTracks.take(60).forEachIndexed { idx, ep ->
-                contentContainer.addView(createTrackRow(ep, podcastTracks, idx))
-            }
-        }
-    }
-
     // =========================================================================
-    // AUDIO PLAYBACK ENGINE (Streams from api.php?route=stream&id=...)
+    // AUDIO PLAYBACK ENGINE (Plays from local phone storage first, streams & saves if not cached)
     // =========================================================================
     private fun playRandomLibraryQueue() {
-        val pool = allTracks.filter { !isPodcastTrack(it) }
+        val pool = getVisibleMusicTracks()
         if (pool.isEmpty()) {
-            Toast.makeText(this, "Biblioteca vazia ou ainda sincronizando.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Nenhuma música disponível no momento.", Toast.LENGTH_SHORT).show()
             return
         }
         isShuffleEnabled = true
-        startPlaybackQueue(pool.shuffled().take(60), 0)
+        startPlaybackQueue(pool.shuffled().take(80), 0)
     }
 
     private fun startPlaybackQueue(tracks: List<TrackItem>, startIndex: Int) {
@@ -1482,9 +2252,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun playCurrentTrack() {
         val track = playQueue.getOrNull(currentQueueIndex) ?: return
-        miniPlayerBar.visibility = View.VISIBLE
+        miniPlayerCard.visibility = View.VISIBLE
         miniTitleTxt.text = track.title
-        miniArtistTxt.text = "${track.artist} • ${track.album}"
+        val offBadge = if (isTrackStoredOffline(track.id)) " • ✓ Offline" else ""
+        miniArtistTxt.text = "${track.artist} • ${track.album}$offBadge"
         miniPlayPauseBtn.text = "⏳"
         loadImageAsync(track.coverUrl, miniCoverImg)
         renderCurrentTab()
@@ -1497,14 +2268,18 @@ class MainActivity : AppCompatActivity() {
 
         ioExecutor.execute {
             try {
-                // Check local offline audio cache first
-                val cacheDir = File(filesDir, "audio_cache").apply { mkdirs() }
-                val cachedFile = File(cacheDir, "track_${track.id}.mp3")
-                val playSource = if (!track.id.startsWith("radio-") && cachedFile.exists() && cachedFile.length() > 1024) {
+                val cachedFile = getTrackOfflineFile(track.id)
+                val playSource = if (!track.id.startsWith("radio-") && cachedFile.exists() && cachedFile.length() > 1024L) {
                     cachedFile.absolutePath
                 } else {
-                    if (!track.id.startsWith("radio-") && prefs.getBoolean(KEY_CACHE_AUDIO, true)) {
-                        cacheTrackInBackground(streamUrl, cachedFile)
+                    if (isOfflineModeActive() && !track.id.startsWith("radio-")) {
+                        mainHandler.post {
+                            Toast.makeText(this, "Esta faixa ainda não foi salva offline.", Toast.LENGTH_SHORT).show()
+                        }
+                        return@execute
+                    }
+                    if (!track.id.startsWith("radio-")) {
+                        cacheSingleTrackAsync(streamUrl, cachedFile)
                     }
                     streamUrl
                 }
@@ -1528,11 +2303,7 @@ class MainActivity : AppCompatActivity() {
                                 registerPlayOnServer(track.id)
                             }
                             setOnCompletionListener {
-                                if (repeatMode == 2) {
-                                    playCurrentTrack()
-                                } else {
-                                    playNext()
-                                }
+                                if (repeatMode == 2) playCurrentTrack() else playNext()
                             }
                             setOnErrorListener { _, _, _ ->
                                 isPlayingState = false
@@ -1549,28 +2320,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun cacheTrackInBackground(streamUrl: String, targetFile: File) {
+    private fun cacheSingleTrackAsync(streamUrl: String, targetFile: File) {
         ioExecutor.execute {
-            try {
-                if (targetFile.exists()) return@execute
-                val tempFile = File(targetFile.parentFile, "${targetFile.name}.tmp")
-                val conn = (URL(streamUrl).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 8000
-                    readTimeout = 15000
+            val limitBytes = if (maxOfflineStorageMB <= 0L) Long.MAX_VALUE else maxOfflineStorageMB * 1024L * 1024L
+            val remaining = (limitBytes - getUsedOfflineAudioBytes()).coerceAtLeast(15L * 1024L * 1024L)
+            if (downloadFileSync(streamUrl, targetFile, remaining)) {
+                mainHandler.post {
+                    updateHeaderStatusUI()
                 }
-                if (conn.responseCode in 200..299) {
-                    conn.inputStream.use { input ->
-                        FileOutputStream(tempFile).use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                    if (tempFile.length() > 1024) {
-                        tempFile.renameTo(targetFile)
-                    } else {
-                        tempFile.delete()
-                    }
-                }
-            } catch (_: Exception) {}
+            }
         }
     }
 
@@ -1626,14 +2384,12 @@ class MainActivity : AppCompatActivity() {
     private fun setupEqualizerForSession(audioSessionId: Int) {
         try {
             audioEqualizer?.release()
-            audioEqualizer = Equalizer(0, audioSessionId).apply {
-                enabled = true
-            }
+            audioEqualizer = Equalizer(0, audioSessionId).apply { enabled = true }
         } catch (_: Exception) {}
     }
 
     private fun registerPlayOnServer(trackId: String) {
-        if (trackId.startsWith("radio-")) return
+        if (trackId.startsWith("radio-") || isOfflineModeActive()) return
         ioExecutor.execute {
             try {
                 httpPostJson(
@@ -1645,6 +2401,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggleFavoriteOnApi(trackId: String) {
+        if (favoriteIds.contains(trackId)) favoriteIds.remove(trackId) else favoriteIds.add(trackId)
+        renderCurrentTab()
+        if (isOfflineModeActive()) return
+
         ioExecutor.execute {
             try {
                 val res = httpPostJson(
@@ -1653,9 +2413,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 val arr = JSONArray(extractJsonPayload(res))
                 val updated = mutableSetOf<String>()
-                for (i in 0 until arr.length()) {
-                    updated.add(arr.optString(i))
-                }
+                for (i in 0 until arr.length()) updated.add(arr.optString(i))
                 mainHandler.post {
                     favoriteIds.clear()
                     favoriteIds.addAll(updated)
@@ -1673,43 +2431,42 @@ class MainActivity : AppCompatActivity() {
         val dialogLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(Color.parseColor("#0b0f19"))
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setBackgroundColor(Color.parseColor("#080d1a"))
+            setPadding(dp(22), dp(22), dp(22), dp(22))
         }
 
-        val cover = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(200), dp(200)).apply { bottomMargin = dp(16) }
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#1e293b"))
+        val cover = createRoundedImageView(dp(220), 20).apply {
+            (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(18)
         }
         loadImageAsync(track.coverUrl, cover)
 
         val title = TextView(this).apply {
             text = track.title
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }
         val artist = TextView(this).apply {
-            text = "${track.artist} — ${track.album}"
+            val offTag = if (isTrackStoredOffline(track.id)) " • ✓ Salva Offline" else ""
+            text = "${track.artist} — ${track.album}$offTag"
             setTextColor(Color.parseColor("#38bdf8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(16))
+            setPadding(0, dp(4), 0, dp(18))
         }
 
         val controlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(16))
+            setPadding(0, dp(8), 0, dp(18))
         }
 
-        val prev = createPillButton("⏮ Anterior", "#1e293b", "#ffffff") { playPrevious() }
-        val playPause = createPillButton(if (isPlayingState) "⏸ Pausar" else "▶ Tocar", "#0284c7", "#ffffff") {
+        val prev = createModernButton("⏮ Anterior", "#1e293b", "#ffffff", 14) { playPrevious() }
+        val playPause = createModernButton(if (isPlayingState) "⏸ Pausar" else "▶ Tocar", "#0ea5e9", "#ffffff", 14) {
             togglePlayPause()
         }.apply { (layoutParams as LinearLayout.LayoutParams).setMargins(dp(10), 0, dp(10), 0) }
-        val next = createPillButton("⏭ Próxima", "#1e293b", "#ffffff") { playNext() }
+        val next = createModernButton("⏭ Próxima", "#1e293b", "#ffffff", 14) { playNext() }
 
         controlsRow.addView(prev)
         controlsRow.addView(playPause)
@@ -1719,10 +2476,10 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        val lyricsBtn = createPillButton("📄 Letra da Música", "#1e293b", "#38bdf8") {
+        val lyricsBtn = createModernButton("📄 Letra", "#1e293b", "#38bdf8", 12) {
             showLyricsDialog(track)
         }
-        val eqBtn = createPillButton("🎚 Equalizador", "#1e293b", "#38bdf8") {
+        val eqBtn = createModernButton("🎚 Equalizador", "#1e293b", "#38bdf8", 12) {
             showEqualizerDialog()
         }.apply { (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8) }
 
@@ -1744,7 +2501,7 @@ class MainActivity : AppCompatActivity() {
     private fun showLyricsDialog(track: TrackItem) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0b0f19"))
+            setBackgroundColor(Color.parseColor("#080d1a"))
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
         val header = TextView(this).apply {
@@ -1795,7 +2552,7 @@ class MainActivity : AppCompatActivity() {
         val eq = audioEqualizer
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0b0f19"))
+            setBackgroundColor(Color.parseColor("#080d1a"))
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
 
@@ -1809,12 +2566,11 @@ class MainActivity : AppCompatActivity() {
         container.addView(title)
 
         if (eq == null) {
-            val info = TextView(this).apply {
+            container.addView(TextView(this).apply {
                 text = "Inicie a reprodução de uma música para ativar o Equalizador de hardware do Android."
                 setTextColor(Color.parseColor("#94a3b8"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            }
-            container.addView(info)
+            })
         } else {
             val bands = eq.numberOfBands.toInt()
             val minLevel = eq.bandLevelRange[0].toInt()
@@ -1824,7 +2580,7 @@ class MainActivity : AppCompatActivity() {
                 val bandIdx = b.toShort()
                 val freqHz = eq.getCenterFreq(bandIdx) / 1000
                 val label = TextView(this).apply {
-                    text = "${if (freqHz >= 1000) "${freqHz / 1000} kHz" else "$freqHz Hz"}"
+                    text = if (freqHz >= 1000) "${freqHz / 1000} kHz" else "$freqHz Hz"
                     setTextColor(Color.WHITE)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 }
@@ -1833,9 +2589,7 @@ class MainActivity : AppCompatActivity() {
                     progress = eq.getBandLevel(bandIdx).toInt() - minLevel
                     setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                         override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                            if (fromUser) {
-                                eq.setBandLevel(bandIdx, (minLevel + p).toShort())
-                            }
+                            if (fromUser) eq.setBandLevel(bandIdx, (minLevel + p).toShort())
                         }
                         override fun onStartTrackingTouch(s: SeekBar?) {}
                         override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -1854,98 +2608,87 @@ class MainActivity : AppCompatActivity() {
 
     private fun showApiConfigDialog() {
         val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#0b0f19"))
+            setBackgroundColor(Color.parseColor("#080d1a"))
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
 
-        val header = TextView(this).apply {
-            text = "⚙ CONEXÃO COM A API DO SERVIDOR PHP"
+        box.addView(TextView(this).apply {
+            text = "🔑 CONFIGURAR SERVIDOR API & LOGIN"
             setTextColor(Color.parseColor("#38bdf8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(0, 0, 0, dp(12))
-        }
-        box.addView(header)
+        })
 
-        val urlLbl = TextView(this).apply {
+        box.addView(TextView(this).apply {
             text = "URL do Servidor PHP (ex: http://leirson.ddns.me/music):"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        }
+        })
         val urlInput = EditText(this).apply {
             setText(serverBaseUrl)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedBox("#111827", "#334155", 8)
+            background = roundedBox("#111827", "#334155", 10)
             isSingleLine = true
         }
-        box.addView(urlLbl)
         box.addView(urlInput)
 
-        val userLbl = TextView(this).apply {
+        box.addView(TextView(this).apply {
             text = "Usuário:"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(10), 0, 0)
-        }
+        })
         val userInput = EditText(this).apply {
             setText(currentUsername)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedBox("#111827", "#334155", 8)
+            background = roundedBox("#111827", "#334155", 10)
             isSingleLine = true
         }
-        box.addView(userLbl)
         box.addView(userInput)
 
-        val passLbl = TextView(this).apply {
-            text = "Senha (opcional para autenticar via api.php?route=login):"
+        box.addView(TextView(this).apply {
+            text = "Senha:"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(10), 0, 0)
-        }
+        })
         val passInput = EditText(this).apply {
-            hint = "Digite a senha para validar login..."
+            hint = "Digite a senha para autenticar..."
             setHintTextColor(Color.parseColor("#64748b"))
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedBox("#111827", "#334155", 8)
+            background = roundedBox("#111827", "#334155", 10)
             isSingleLine = true
         }
-        box.addView(passLbl)
         box.addView(passInput)
-
-        val cacheSwitch = Switch(this).apply {
-            text = "Cachear músicas reproduzidas para ouvir Offline"
-            setTextColor(Color.WHITE)
-            isChecked = prefs.getBoolean(KEY_CACHE_AUDIO, true)
-            setPadding(0, dp(14), 0, dp(14))
-        }
-        box.addView(cacheSwitch)
 
         scroll.addView(box)
 
-        val dialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_NoActionBar)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_NoActionBar)
             .setView(scroll)
             .setNegativeButton("Cancelar", null)
-            .setPositiveButton("Salvar e Conectar") { _, _ ->
+            .setPositiveButton("Salvar e Sincronizar") { _, _ ->
                 val newUrl = normalizeServerUrl(urlInput.text.toString())
                 val newUser = userInput.text.toString().trim().ifEmpty { "admin" }
                 val rawPass = passInput.text.toString().trim()
 
                 serverBaseUrl = newUrl
                 currentUsername = newUser
+                forceOfflineMode = false
                 prefs.edit()
                     .putString(KEY_SERVER_URL, serverBaseUrl)
                     .putString(KEY_USERNAME, currentUsername)
-                    .putBoolean(KEY_CACHE_AUDIO, cacheSwitch.isChecked)
+                    .putBoolean(KEY_FORCE_OFFLINE, false)
                     .apply()
 
                 if (rawPass.isNotEmpty()) {
@@ -1960,68 +2703,112 @@ class MainActivity : AppCompatActivity() {
                                 currentRole = obj.optString("role", "ouvinte")
                                 prefs.edit().putString(KEY_ROLE, currentRole).apply()
                                 mainHandler.post {
-                                    Toast.makeText(this, "Autenticado como $newUser ($currentRole)!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(this, "Autenticado como $newUser!", Toast.LENGTH_SHORT).show()
                                 }
                             }
-                        } catch (e: Exception) {
-                            mainHandler.post {
-                                Toast.makeText(this, "Aviso de login: ${e.message}", Toast.LENGTH_SHORT).show()
-                            }
+                        } catch (_: Exception) {
                         } finally {
-                            mainHandler.post { syncAllFromApi() }
+                            mainHandler.post { syncAllFromApi(true) }
                         }
                     }
                 } else {
-                    syncAllFromApi()
+                    syncAllFromApi(true)
                 }
             }
-            .create()
-
-        dialog.show()
+            .show()
     }
 
     // =========================================================================
-    // HELPERS
+    // IMAGE LOADING (MEMORY + LOCAL DISK CACHE FOR OFFLINE COVERS)
     // =========================================================================
+    private fun hashKeyForDisk(url: String): String {
+        return try {
+            val md = MessageDigest.getInstance("MD5")
+            md.digest(url.toByteArray()).joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            url.hashCode().toString()
+        }
+    }
+
+    private fun cacheImageToDiskSync(url: String) {
+        if (url.isEmpty()) return
+        val diskFile = File(getImageCacheDir(), "img_${hashKeyForDisk(url)}.bin")
+        if (diskFile.exists() && diskFile.length() > 128L) return
+        try {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 7000
+                setRequestProperty("User-Agent", "Mozilla/5.0")
+            }
+            if (conn.responseCode in 200..299) {
+                conn.inputStream.use { input ->
+                    FileOutputStream(diskFile).use { output -> input.copyTo(output) }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
     private fun loadImageAsync(url: String, target: ImageView) {
         target.setImageBitmap(null)
         if (url.isEmpty()) return
-        val cached = bitmapCache.get(url)
-        if (cached != null) {
-            target.setImageBitmap(cached)
+        val memBmp = bitmapCache.get(url)
+        if (memBmp != null) {
+            target.setImageBitmap(memBmp)
             return
         }
         target.tag = url
         ioExecutor.execute {
             try {
-                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 5000
-                    readTimeout = 7000
-                    setRequestProperty("User-Agent", "Mozilla/5.0")
+                val diskFile = File(getImageCacheDir(), "img_${hashKeyForDisk(url)}.bin")
+                var bmp: Bitmap? = null
+                if (diskFile.exists() && diskFile.length() > 128L) {
+                    bmp = BitmapFactory.decodeFile(diskFile.absolutePath)
                 }
-                if (conn.responseCode in 200..299) {
-                    val bmp = BitmapFactory.decodeStream(conn.inputStream)
-                    if (bmp != null) {
-                        bitmapCache.put(url, bmp)
-                        mainHandler.post {
-                            if (target.tag == url) {
-                                target.setImageBitmap(bmp)
-                            }
+                if (bmp == null && !isOfflineModeActive()) {
+                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 5000
+                        readTimeout = 7000
+                        setRequestProperty("User-Agent", "Mozilla/5.0")
+                    }
+                    if (conn.responseCode in 200..299) {
+                        val bytes = conn.inputStream.readBytes()
+                        if (bytes.isNotEmpty()) {
+                            FileOutputStream(diskFile).use { it.write(bytes) }
+                            bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         }
+                    }
+                }
+                if (bmp != null) {
+                    bitmapCache.put(url, bmp)
+                    mainHandler.post {
+                        if (target.tag == url) target.setImageBitmap(bmp)
                     }
                 }
             } catch (_: Exception) {}
         }
     }
 
-    private fun createPillButton(label: String, bgHex: String, fgHex: String, onClick: () -> Unit): TextView {
+    // =========================================================================
+    // UI WIDGET HELPERS
+    // =========================================================================
+    private fun createRoundedImageView(sizePx: Int, radiusDp: Int): ImageView {
+        return ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(sizePx, sizePx)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = roundedBox("#162038", "#253252", radiusDp)
+            clipToOutline = true
+            outlineProvider = ViewOutlineProvider.BACKGROUND
+        }
+    }
+
+    private fun createModernButton(label: String, bgHex: String, fgHex: String, radiusDp: Int, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             text = label
             setTextColor(Color.parseColor(fgHex))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12), dp(7), dp(12), dp(7))
-            background = roundedBox(bgHex, bgHex, 8)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = roundedBox(bgHex, bgHex, radiusDp)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -2034,7 +2821,7 @@ class MainActivity : AppCompatActivity() {
         return TextView(this).apply {
             text = symbol
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setPadding(dp(10), dp(6), dp(10), dp(6))
             setOnClickListener { onClick() }
         }
@@ -2082,8 +2869,9 @@ class MainActivity : AppCompatActivity() {
                 selectedArtistFilter = null
                 renderCurrentTab()
             }
-            currentTab == "webview" && webView?.canGoBack() == true -> {
-                webView?.goBack()
+            selectedPodcastFilter != null -> {
+                selectedPodcastFilter = null
+                renderCurrentTab()
             }
             else -> super.onBackPressed()
         }
