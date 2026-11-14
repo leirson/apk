@@ -142,7 +142,8 @@ class MainActivity : AppCompatActivity() {
     private var currentRole: String = "admin"
     private var isServerReachable: Boolean = false
     private var isSyncEnabled: Boolean = true
-    private var isAutoOfflineDownloadEnabled: Boolean = true
+    private var syncOnlyPlayed: Boolean = true
+    private var isAutoOfflineDownloadEnabled: Boolean = false
     private var forceOfflineMode: Boolean = false
     private var maxOfflineStorageMB: Long = 2048L // Default 2 GB
     private var downloadedSyncProgressText: String = ""
@@ -209,6 +210,7 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_USERNAME = "username"
         private const val KEY_ROLE = "user_role"
         private const val KEY_SYNC_ENABLED = "sync_enabled"
+        private const val KEY_SYNC_ONLY_PLAYED = "sync_only_played"
         private const val KEY_AUTO_OFFLINE_DL = "auto_offline_download"
         private const val KEY_FORCE_OFFLINE = "force_offline_mode"
         private const val KEY_MAX_OFFLINE_MB = "max_offline_storage_mb"
@@ -239,7 +241,8 @@ class MainActivity : AppCompatActivity() {
         currentUsername = prefs.getString(KEY_USERNAME, "admin") ?: "admin"
         currentRole = prefs.getString(KEY_ROLE, "admin") ?: "admin"
         isSyncEnabled = prefs.getBoolean(KEY_SYNC_ENABLED, true)
-        isAutoOfflineDownloadEnabled = prefs.getBoolean(KEY_AUTO_OFFLINE_DL, true)
+        syncOnlyPlayed = prefs.getBoolean(KEY_SYNC_ONLY_PLAYED, true)
+        isAutoOfflineDownloadEnabled = prefs.getBoolean(KEY_AUTO_OFFLINE_DL, !syncOnlyPlayed)
         forceOfflineMode = prefs.getBoolean(KEY_FORCE_OFFLINE, false)
         maxOfflineStorageMB = prefs.getLong(KEY_MAX_OFFLINE_MB, 2048L)
 
@@ -271,14 +274,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // SYNC ENABLE / DISABLE CONTROLLER
+    // SYNC ENABLE / DISABLE & "ONLY PLAYED" MODE CONTROLLER
     // =========================================================================
     private fun setSyncEnabledState(enabled: Boolean, showFeedback: Boolean = true) {
         isSyncEnabled = enabled
         prefs.edit().putBoolean(KEY_SYNC_ENABLED, enabled).apply()
 
         if (!enabled) {
-            // Stop any active background download immediately
             downloadedSyncProgressText = "Sincronização desativada pelo usuário"
             updateHeaderStatusUI()
             renderCurrentTab()
@@ -286,10 +288,15 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Sincronização (Sync) desativada. Usando apenas dados locais.", Toast.LENGTH_SHORT).show()
             }
         } else {
-            downloadedSyncProgressText = ""
+            downloadedSyncProgressText = if (syncOnlyPlayed) {
+                "Modo ativo: Sincronizar somente o que for tocado"
+            } else {
+                "Modo ativo: Sincronizar e baixar biblioteca completa"
+            }
             updateHeaderStatusUI()
             if (showFeedback) {
-                Toast.makeText(this, "Sincronização (Sync) ativada! Sincronizando com o servidor...", Toast.LENGTH_SHORT).show()
+                val modeMsg = if (syncOnlyPlayed) "Sincronizando catálogo (salvando músicas somente ao tocar)..." else "Sincronizando catálogo e baixando músicas..."
+                Toast.makeText(this, modeMsg, Toast.LENGTH_SHORT).show()
             }
             if (!forceOfflineMode) {
                 syncAllFromApi(false)
@@ -297,6 +304,32 @@ class MainActivity : AppCompatActivity() {
                 renderCurrentTab()
             }
         }
+    }
+
+    private fun setSyncOnlyPlayedMode(onlyPlayed: Boolean, showFeedback: Boolean = true) {
+        syncOnlyPlayed = onlyPlayed
+        isAutoOfflineDownloadEnabled = !onlyPlayed
+        prefs.edit()
+            .putBoolean(KEY_SYNC_ONLY_PLAYED, onlyPlayed)
+            .putBoolean(KEY_AUTO_OFFLINE_DL, !onlyPlayed)
+            .apply()
+
+        if (onlyPlayed) {
+            downloadedSyncProgressText = "🎧 Modo ativo: Salvando no celular somente o que for tocado (${getOfflineTracksCount()} salvas)"
+            if (showFeedback) {
+                Toast.makeText(this, "Ativado: Sincronizar somente o que for tocado!", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            downloadedSyncProgressText = "📥 Modo ativo: Download automático da biblioteca"
+            if (showFeedback) {
+                Toast.makeText(this, "Ativado: Download automático de todas as músicas!", Toast.LENGTH_SHORT).show()
+            }
+            if (isSyncEnabled && !forceOfflineMode) {
+                startAutoOfflineDownloadWorker(false)
+            }
+        }
+        updateHeaderStatusUI()
+        renderCurrentTab()
     }
 
     // =========================================================================
@@ -465,7 +498,7 @@ class MainActivity : AppCompatActivity() {
                 val missingTracks = orderedTracks.filter { !isTrackStoredOffline(it.id) && !it.id.startsWith("radio-") }
 
                 for ((idx, track) in missingTracks.withIndex()) {
-                    if (!isSyncEnabled || forceOfflineMode) break
+                    if (!isSyncEnabled || syncOnlyPlayed || forceOfflineMode) break
                     val currentUsed = getUsedOfflineAudioBytes()
                     if (currentUsed >= limitBytes) {
                         mainHandler.post {
@@ -562,9 +595,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun enforceStorageQuotaIfNeeded() {
+    private fun enforceStorageQuotaIfNeeded(reserveBytes: Long = 0L) {
         if (maxOfflineStorageMB <= 0L) return
-        val maxBytes = maxOfflineStorageMB * 1024L * 1024L
+        val maxBytes = (maxOfflineStorageMB * 1024L * 1024L - reserveBytes).coerceAtLeast(10L * 1024L * 1024L)
         val files = getAudioCacheDir().listFiles()?.filter { it.isFile && it.name.endsWith(".mp3") }?.sortedBy { it.lastModified() } ?: return
         var used = files.sumOf { it.length() }
         for (f in files) {
@@ -681,9 +714,9 @@ class MainActivity : AppCompatActivity() {
         titleCol.addView(appTitle)
         titleCol.addView(headerGreetingTxt)
 
-        // Quick Sync Enable/Disable Toggle Pill in Header
+        // Quick Sync Mode Toggle Pill in Header (cycles: Somente Tocado -> Sync Tudo -> Sync Off)
         headerSyncBadge = TextView(this).apply {
-            text = "SYNC ON"
+            text = "🎧 SÓ TOCADO"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(10), dp(6), dp(10), dp(6))
@@ -692,7 +725,23 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { rightMargin = dp(6) }
             setOnClickListener {
-                setSyncEnabledState(!isSyncEnabled, true)
+                when {
+                    !isSyncEnabled -> {
+                        syncOnlyPlayed = true
+                        isAutoOfflineDownloadEnabled = false
+                        prefs.edit()
+                            .putBoolean(KEY_SYNC_ONLY_PLAYED, true)
+                            .putBoolean(KEY_AUTO_OFFLINE_DL, false)
+                            .apply()
+                        setSyncEnabledState(true, true)
+                    }
+                    syncOnlyPlayed -> {
+                        setSyncOnlyPlayedMode(false, true)
+                    }
+                    else -> {
+                        setSyncEnabledState(false, true)
+                    }
+                }
             }
         }
 
@@ -985,8 +1034,12 @@ class MainActivity : AppCompatActivity() {
             headerSyncBadge.text = "📴 OFFLINE"
             headerSyncBadge.setTextColor(Color.parseColor("#fb7185"))
             headerSyncBadge.background = roundedBox("#4c0519", "#f43f5e", 12)
+        } else if (syncOnlyPlayed) {
+            headerSyncBadge.text = "🎧 SÓ TOCADO"
+            headerSyncBadge.setTextColor(Color.parseColor("#38bdf8"))
+            headerSyncBadge.background = roundedBox("#082f49", "#0ea5e9", 12)
         } else {
-            headerSyncBadge.text = "🔄 SYNC ON"
+            headerSyncBadge.text = "🔄 SYNC TUDO"
             headerSyncBadge.setTextColor(Color.parseColor("#34d399"))
             headerSyncBadge.background = roundedBox("#052e16", "#10b981", 12)
         }
@@ -1125,9 +1178,14 @@ class MainActivity : AppCompatActivity() {
                     renderCurrentTab()
 
                     if (triggerToast) {
-                        Toast.makeText(this, "Sincronização concluída!", Toast.LENGTH_SHORT).show()
+                        val msg = if (syncOnlyPlayed) {
+                            "Catálogo sincronizado! As músicas serão salvas à medida que forem tocadas."
+                        } else {
+                            "Sincronização concluída! Baixando músicas em segundo plano..."
+                        }
+                        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                     }
-                    if (isSyncEnabled && isAutoOfflineDownloadEnabled) {
+                    if (isSyncEnabled && !syncOnlyPlayed && isAutoOfflineDownloadEnabled) {
                         startAutoOfflineDownloadWorker(false)
                     }
                 }
@@ -2387,12 +2445,18 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
         })
         syncTitleCol.addView(TextView(this).apply {
-            text = if (isSyncEnabled) {
-                "ATIVO • Sincroniza catálogo e baixa músicas automaticamente"
-            } else {
-                "DESATIVADO • Operando somente com arquivos salvos no celular"
+            text = when {
+                !isSyncEnabled -> "DESATIVADO • Operando somente com arquivos já salvos no celular"
+                syncOnlyPlayed -> "ATIVO (SOMENTE O QUE FOR TOCADO) • Salva offline cada música ao reproduzir"
+                else -> "ATIVO (BIBLIOTECA COMPLETA) • Baixa todas as músicas automaticamente"
             }
-            setTextColor(if (isSyncEnabled) Color.parseColor("#34d399") else Color.parseColor("#fbbf24"))
+            setTextColor(
+                when {
+                    !isSyncEnabled -> Color.parseColor("#fbbf24")
+                    syncOnlyPlayed -> Color.parseColor(activeTheme.accentHex)
+                    else -> Color.parseColor("#34d399")
+                }
+            )
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
         })
 
@@ -2407,20 +2471,91 @@ class MainActivity : AppCompatActivity() {
         syncTopHeader.addView(masterSyncSwitch)
         syncControlCard.addView(syncTopHeader)
 
-        // Sub-switch: Auto download offline MP3s when syncing
+        // Quick 3-Mode Selector Row (Somente o que for tocado | Baixar Tudo | Desativar Sync)
+        val syncModesRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(8)
+            }
+        }
+
+        val btnPlayedOnlyMode = createModernButton(
+            if (isSyncEnabled && syncOnlyPlayed) "✓ 🎧 Só o Tocado" else "🎧 Só o Tocado",
+            if (isSyncEnabled && syncOnlyPlayed) activeTheme.primaryHex else "#0f172a",
+            "#ffffff",
+            10
+        ) {
+            if (!isSyncEnabled) {
+                isSyncEnabled = true
+                prefs.edit().putBoolean(KEY_SYNC_ENABLED, true).apply()
+            }
+            setSyncOnlyPlayedMode(true, true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) }
+            gravity = Gravity.CENTER
+        }
+
+        val btnAllAutoMode = createModernButton(
+            if (isSyncEnabled && !syncOnlyPlayed) "✓ 📥 Baixar Tudo" else "📥 Baixar Tudo",
+            if (isSyncEnabled && !syncOnlyPlayed) "#10b981" else "#0f172a",
+            if (isSyncEnabled && !syncOnlyPlayed) "#052e16" else "#cbd5e1",
+            10
+        ) {
+            if (!isSyncEnabled) {
+                isSyncEnabled = true
+                prefs.edit().putBoolean(KEY_SYNC_ENABLED, true).apply()
+            }
+            setSyncOnlyPlayedMode(false, true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) }
+            gravity = Gravity.CENTER
+        }
+
+        val btnDisableSyncMode = createModernButton(
+            if (!isSyncEnabled) "✓ ⏸ Sync Off" else "⏸ Sync Off",
+            if (!isSyncEnabled) "#f59e0b" else "#0f172a",
+            if (!isSyncEnabled) "#451a03" else "#cbd5e1",
+            10
+        ) {
+            setSyncEnabledState(false, true)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.CENTER
+        }
+
+        syncModesRow.addView(btnPlayedOnlyMode)
+        syncModesRow.addView(btnAllAutoMode)
+        syncModesRow.addView(btnDisableSyncMode)
+        syncControlCard.addView(syncModesRow)
+
+        // Switch 1: Sincronizar somente o que for tocado
+        val onlyPlayedSwitch = Switch(this).apply {
+            text = "🎧 Sincronizar somente o que for tocado (Salvar no celular ao reproduzir)"
+            setTextColor(Color.WHITE)
+            textSize = 11f
+            isChecked = syncOnlyPlayed
+            isEnabled = isSyncEnabled
+            setPadding(0, dp(6), 0, dp(6))
+            setOnCheckedChangeListener { _, checked ->
+                setSyncOnlyPlayedMode(checked, true)
+            }
+        }
+        syncControlCard.addView(onlyPlayedSwitch)
+
+        // Switch 2: Baixar todas as músicas automaticamente
         val autoDlSwitch = Switch(this).apply {
-            text = "Baixar músicas automaticamente para o celular ao sincronizar"
+            text = "📥 Baixar toda a biblioteca automaticamente em segundo plano"
             setTextColor(Color.parseColor("#cbd5e1"))
             textSize = 11f
-            isChecked = isAutoOfflineDownloadEnabled
+            isChecked = !syncOnlyPlayed && isAutoOfflineDownloadEnabled
             isEnabled = isSyncEnabled
-            setPadding(0, dp(10), 0, dp(10))
+            setPadding(0, dp(4), 0, dp(10))
             setOnCheckedChangeListener { _, checked ->
-                isAutoOfflineDownloadEnabled = checked
-                prefs.edit().putBoolean(KEY_AUTO_OFFLINE_DL, checked).apply()
-                if (checked && isSyncEnabled) {
-                    startAutoOfflineDownloadWorker(true)
-                }
+                setSyncOnlyPlayedMode(!checked, true)
             }
         }
         syncControlCard.addView(autoDlSwitch)
@@ -2559,7 +2694,7 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit().putLong(KEY_MAX_OFFLINE_MB, mbVal).apply()
                 enforceStorageQuotaIfNeeded()
                 renderCurrentTab()
-                if (isSyncEnabled) startAutoOfflineDownloadWorker(true)
+                if (isSyncEnabled && !syncOnlyPlayed) startAutoOfflineDownloadWorker(true)
             }.apply {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     if (index % 3 != 2) rightMargin = dp(6)
@@ -2576,8 +2711,24 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
         }
 
-        val downloadAllNowBtn = createModernButton("⬇ Baixar Músicas Offline", activeTheme.primaryHex, "#ffffff", 12) {
-            startAutoOfflineDownloadWorker(true)
+        val downloadAllNowBtn = createModernButton(
+            if (syncOnlyPlayed) "🎧 Modo: Salvar Só ao Tocar" else "⬇ Baixar Biblioteca Offline",
+            if (syncOnlyPlayed) "#0f172a" else activeTheme.primaryHex,
+            if (syncOnlyPlayed) activeTheme.accentHex else "#ffffff",
+            12
+        ) {
+            if (syncOnlyPlayed) {
+                AlertDialog.Builder(this)
+                    .setTitle("Modo 'Somente o que for tocado' ativo")
+                    .setMessage("No modo atual, o aplicativo salva no celular apenas as músicas que você reproduz.\n\nDeseja manter assim ou baixar toda a biblioteca agora?")
+                    .setNegativeButton("Manter Só o Tocado", null)
+                    .setPositiveButton("Baixar Tudo Agora") { _, _ ->
+                        setSyncOnlyPlayedMode(false, true)
+                    }
+                    .show()
+            } else {
+                startAutoOfflineDownloadWorker(true)
+            }
         }.apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) }
             gravity = Gravity.CENTER
@@ -2794,16 +2945,18 @@ class MainActivity : AppCompatActivity() {
             try {
                 val cachedFile = getTrackOfflineFile(track.id)
                 val playSource = if (!track.id.startsWith("radio-") && cachedFile.exists() && cachedFile.length() > 1024L) {
+                    // Touch lastModified so frequently played tracks are kept longest in quota
+                    try { cachedFile.setLastModified(System.currentTimeMillis()) } catch (_: Exception) {}
                     cachedFile.absolutePath
                 } else {
                     if (isOfflineModeActive() && !track.id.startsWith("radio-")) {
                         mainHandler.post {
-                            Toast.makeText(this, "Esta faixa não está salva offline.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this, "Esta faixa ainda não foi tocada/salva para uso offline.", Toast.LENGTH_SHORT).show()
                         }
                         return@execute
                     }
                     if (!track.id.startsWith("radio-") && isSyncEnabled) {
-                        cacheSingleTrackAsync(streamUrl, cachedFile)
+                        cacheSingleTrackOnPlayAsync(track, streamUrl, cachedFile)
                     }
                     streamUrl
                 }
@@ -2844,16 +2997,34 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun cacheSingleTrackAsync(streamUrl: String, targetFile: File) {
+    /**
+     * Saves the currently played track (and its cover art) into local phone storage
+     * while respecting the user's storage quota (evicting oldest tracks if needed).
+     */
+    private fun cacheSingleTrackOnPlayAsync(track: TrackItem, streamUrl: String, targetFile: File) {
         if (!isSyncEnabled) return
         ioExecutor.execute {
-            val limitBytes = if (maxOfflineStorageMB <= 0L) Long.MAX_VALUE else maxOfflineStorageMB * 1024L * 1024L
-            val remaining = (limitBytes - getUsedOfflineAudioBytes()).coerceAtLeast(15L * 1024L * 1024L)
-            if (downloadFileSync(streamUrl, targetFile, remaining)) {
-                mainHandler.post {
-                    updateHeaderStatusUI()
+            try {
+                // Ensure room for the newly played track within user's selected storage limit
+                enforceStorageQuotaIfNeeded(15L * 1024L * 1024L)
+                if (track.coverUrl.isNotEmpty()) {
+                    cacheImageToDiskSync(track.coverUrl)
                 }
-            }
+                val limitBytes = if (maxOfflineStorageMB <= 0L) Long.MAX_VALUE else maxOfflineStorageMB * 1024L * 1024L
+                val remaining = (limitBytes - getUsedOfflineAudioBytes()).coerceAtLeast(20L * 1024L * 1024L)
+                if (downloadFileSync(streamUrl, targetFile, remaining)) {
+                    mainHandler.post {
+                        val totalOff = getOfflineTracksCount()
+                        downloadedSyncProgressText = "✓ Salva ao tocar: ${track.title} ($totalOff no celular)"
+                        val currentPlaying = playQueue.getOrNull(currentQueueIndex)
+                        if (currentPlaying?.id == track.id) {
+                            miniArtistTxt.text = "${track.artist} • ${track.album} • ✓ Offline"
+                        }
+                        updateHeaderStatusUI()
+                        renderCurrentTab()
+                    }
+                }
+            } catch (_: Exception) {}
         }
     }
 
