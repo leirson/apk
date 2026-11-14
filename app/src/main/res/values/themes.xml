@@ -1,0 +1,10 @@
+<resources>
+    <!-- Base application theme. -->
+    <style name="Theme.PHPMusicPlayer" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Customize your light theme here. -->
+        <item name="colorPrimary">#0ea5e9</item>
+        <item name="android:statusBarColor">#070b13</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">#070b13</item>
+    </style>
+</resources>
